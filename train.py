@@ -45,7 +45,7 @@ wandb_project = 'owt'
 wandb_run_name = 'fw' # 'run' + str(time.time())
 # data
 dataset = 'fineweb'
-gradient_accumulation_steps = 8 * 4 # used to simulate larger batch sizes
+gradient_accumulation_steps = 4 * 4 # used to simulate larger batch sizes
 batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 256
 # model
@@ -70,7 +70,7 @@ min_lr = 5e-4 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
