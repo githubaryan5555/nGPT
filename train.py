@@ -33,9 +33,9 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out_fineweb'
-eval_interval = 200
-log_interval = 10
-eval_iters = 200
+eval_interval = 5
+log_interval = 1
+eval_iters = 5
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -63,7 +63,7 @@ beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 50 # how many steps to warm up for
+warmup_iters = 5 # how many steps to warm up for
 lr_decay_iters = 500 # should be ~= max_iters per Chinchilla
 min_lr = 5e-4 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
