@@ -46,7 +46,7 @@ wandb_run_name = 'fw' # 'run' + str(time.time())
 # data
 dataset = 'fineweb'
 gradient_accumulation_steps = 8 * 8 # used to simulate larger batch sizes
-batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 256
 # model
 n_layer = 4
