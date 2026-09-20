@@ -49,7 +49,7 @@ min_lr = 5e-4
 
 # ---------------------------- system ---------------------------
 device = 'cuda'
-dtype = 'auto'
+dtype = 'float16'
 compile = True
 compile_mode = 'default'
 seed = 1337
