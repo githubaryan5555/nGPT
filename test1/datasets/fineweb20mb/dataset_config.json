@@ -1,0 +1,19 @@
+{
+  "raw_data": "fineweb_sample.txt",
+  "tokenizer": "tokenizers/tokenizer.json",
+  "vocab_size": 8192,
+  "token_dtype": "uint16",
+  "token_bytes": 2,
+  "requested_train_ratio": 0.9,
+  "requested_val_ratio": 0.09999999999999998,
+  "actual_train_ratio": 0.899521474769594,
+  "actual_val_ratio": 0.10047852523040599,
+  "raw_file_bytes": 20971428,
+  "train_raw_bytes": 18874305,
+  "val_raw_bytes": 2097123,
+  "train_tokens": 5042694,
+  "val_tokens": 563280,
+  "total_tokens": 5605974,
+  "train_file": "data/train.bin",
+  "val_file": "data/val.bin"
+}
