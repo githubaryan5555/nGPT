@@ -1,3 +1,4 @@
+import torch
 
 # config.py — every variable here is read AND used by train.py
 # edit this file instead of passing CLI flags
