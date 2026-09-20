@@ -37,7 +37,7 @@ print(f"using dtype: {dtype}")
 device = C.device
 device_type = 'cuda' if 'cuda' in device else 'cpu'
 if device_type == 'cuda':
-    torch.cuda.set_device(0)
+    torch.cuda.set_device(device)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
@@ -104,14 +104,30 @@ else:
 iter_num = 0
 best_val_loss = 1e9
 
-# attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
+# attempt to derive vocab_size from the dataset.
+# priority: tokenizers.json -> tokenizer_config.json -> meta.pkl (legacy) -> GPT-2 default
 meta_vocab_size = None
-if os.path.exists(meta_path):
+tok_json_path = os.path.join(data_dir, 'tokenizers.json')
+tok_cfg_path = os.path.join(data_dir, 'tokenizer_config.json')
+meta_path = os.path.join(data_dir, 'meta.pkl')
+if os.path.exists(tok_json_path):
+    from tokenizers import Tokenizer
+    meta_vocab_size = Tokenizer.from_file(tok_json_path).get_vocab_size()
+    print(f"found vocab_size = {meta_vocab_size} (inside {tok_json_path})")
+elif os.path.exists(tok_cfg_path):
+    import json
+    with open(tok_cfg_path) as f:
+        meta_vocab_size = json.load(f)['vocab_size']
+    print(f"found vocab_size = {meta_vocab_size} (inside {tok_cfg_path})")
+elif os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+
+# pad vocab up to a multiple of 64 for tensor-core efficiency (unused rows are harmless)
+if meta_vocab_size is not None:
+    meta_vocab_size = ((meta_vocab_size + 63) // 64) * 64
 
 # model init
 model_args = dict(n_layer=C.n_layer, n_head=C.n_head, n_embd=C.n_embd,
