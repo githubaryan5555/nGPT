@@ -30,8 +30,8 @@ dropout = 0.0
 bias = False
 
 # ---------------------------- batching -------------------------
-batch_size = 512
-gradient_accumulation_steps = 32
+batch_size = 256
+gradient_accumulation_steps = 64
 
 # --------------------------- optimizer -------------------------
 learning_rate = 1e-3
