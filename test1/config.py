@@ -21,6 +21,7 @@ dataset = 'fineweb20mb'
 preload_data_to_gpu = False
 
 # ---------------------------- model ----------------------------
+vocab_size = 8192
 n_layer = 8
 n_head = 8
 n_embd = 256
