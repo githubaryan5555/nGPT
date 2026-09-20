@@ -51,7 +51,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 
 # ---------------------------- system ---------------------------
 device = 'cuda'
-
+seed = 1337
 dtype = (
     'float16'
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
