@@ -1,1 +1,183 @@
-suffering begins here 
+nanogpt base:
+config:
+out_dir = 'out_fineweb'
+eval_interval = 5
+log_interval = 1
+eval_iters = 5
+eval_only = False # if True, script out_dir = 'out_fineweb'
+eval_interval = 100
+log_interval = 10
+eval_iters = 25
+eval_only = False # if True, script exits right after the first eval
+always_save_checkpoint = True # if True, always save a checkpoint after each eval
+init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+# wandb logging
+wandb_log = False # disabled by default
+wandb_project = 'owt'
+wandb_run_name = 'fw' # 'run' + str(time.time())
+# data
+dataset = 'fineweb'
+gradient_accumulation_steps = 4 * 4 # used to simulate larger batch sizes
+batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 256
+# model
+n_layer = 8
+n_head = 8
+n_embd = 256
+dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+bias = False # do we use bias inside LayerNorm and Linear layers?
+# adamw optimizer
+learning_rate = 1e-3 # max learning rate
+max_iters = 1000 # total number of training iterations
+weight_decay = 1e-1
+beta1 = 0.9
+beta2 = 0.95
+grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+# learning rate decay settings
+decay_lr = True # whether to decay the learning rate
+warmup_iters = 50 # how many steps to warm up for
+lr_decay_iters = 1000 # should be ~= max_iters per Chinchilla
+min_lr = 5e-4 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+# DDP settings
+backend = 'nccl' # 'nccl', 'gloo', etc.
+# system
+device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+compile = True # use PyTorch 2.0 to compile the model to be faster
+
+output:
+vram:
+6.6 / 15.0 GB (iter0) (tesla t4) 
+tokens per iteration will be: 262,144
+Initializing a new model from scratch
+defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)
+number of parameters: 19.17M
+/content/nGPT/nGPT/nGPT/train.py:196: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+num decayed parameter tensors: 34, with 19,234,816 parameters
+num non-decayed parameter tensors: 17, with 4,352 parameters
+using fused AdamW: True
+compiling the model... (takes a ~minute)
+W0920 00:04:01.148000 3650 torch/_inductor/utils.py:1731] [0/0] Not enough SMs to use max_autotune_gemm mode
+step 0: train loss 10.8751, val loss 10.8768
+iter 0: loss 10.8726, time 26139.06ms, mfu -100.00%
+iter 10: loss 10.1699, time 3034.78ms, mfu 3.36%
+iter 20: loss 9.2852, time 3160.97ms, mfu 3.35%
+iter 30: loss 8.2361, time 3255.03ms, mfu 3.32%
+iter 40: loss 7.4287, time 3380.30ms, mfu 3.29%
+iter 50: loss 7.1504, time 3347.08ms, mfu 3.27%
+iter 60: loss 6.9219, time 3321.10ms, mfu 3.25%
+iter 70: loss 6.8020, time 3327.20ms, mfu 3.23%
+iter 80: loss 6.6545, time 3353.14ms, mfu 3.21%
+iter 90: loss 6.5823, time 3346.64ms, mfu 3.19%
+step 100: train loss 6.3929, val loss 6.6343
+saving checkpoint to out_fineweb
+iter 100: loss 6.4028, time 7464.53ms, mfu 3.01%
+iter 110: loss 6.3259, time 3391.96ms, mfu 3.01%
+iter 120: loss 6.2522, time 3394.24ms, mfu 3.01%
+iter 130: loss 6.1413, time 3368.38ms, mfu 3.01%
+iter 140: loss 6.1425, time 3394.27ms, mfu 3.01%
+iter 150: loss 6.0612, time 3383.75ms, mfu 3.01%
+iter 160: loss 5.9523, time 3373.40ms, mfu 3.01%
+iter 170: loss 5.8381, time 3383.06ms, mfu 3.01%
+iter 180: loss 5.7998, time 3376.56ms, mfu 3.01%
+iter 190: loss 5.8769, time 3369.11ms, mfu 3.01%
+step 200: train loss 5.7915, val loss 6.2030
+saving checkpoint to out_fineweb
+iter 200: loss 5.7844, time 7513.28ms, mfu 2.85%
+iter 210: loss 5.6864, time 3356.74ms, mfu 2.87%
+iter 220: loss 5.7204, time 3366.16ms, mfu 2.88%
+iter 230: loss 5.4977, time 3364.55ms, mfu 2.90%
+iter 240: loss 5.7061, time 3361.52ms, mfu 2.91%
+iter 250: loss 5.5750, time 3373.40ms, mfu 2.92%
+iter 260: loss 5.5139, time 3378.88ms, mfu 2.93%
+iter 270: loss 5.5115, time 3371.86ms, mfu 2.94%
+iter 280: loss 5.4464, time 3379.22ms, mfu 2.95%
+iter 290: loss 5.4637, time 3385.95ms, mfu 2.96%
+step 300: train loss 5.3306, val loss 5.9369
+saving checkpoint to out_fineweb
+iter 300: loss 5.2671, time 7694.42ms, mfu 2.79%
+iter 310: loss 5.2994, time 3359.16ms, mfu 2.82%
+iter 320: loss 5.2426, time 3366.10ms, mfu 2.84%
+iter 330: loss 5.2101, time 3358.13ms, mfu 2.86%
+iter 340: loss 5.1215, time 3368.54ms, mfu 2.87%
+iter 350: loss 5.1267, time 3361.78ms, mfu 2.89%
+iter 360: loss 5.1085, time 3369.37ms, mfu 2.90%
+iter 370: loss 5.0959, time 3374.22ms, mfu 2.92%
+iter 380: loss 5.0226, time 3371.48ms, mfu 2.93%
+iter 390: loss 4.9794, time 3373.49ms, mfu 2.94%
+step 400: train loss 4.9827, val loss 5.8114
+saving checkpoint to out_fineweb
+iter 400: loss 4.9693, time 7551.71ms, mfu 2.78%
+iter 410: loss 4.9329, time 3365.41ms, mfu 2.80%
+iter 420: loss 4.8813, time 3366.23ms, mfu 2.83%
+iter 430: loss 4.9088, time 3367.68ms, mfu 2.85%
+iter 440: loss 4.8400, time 3355.69ms, mfu 2.86%
+iter 450: loss 4.8494, time 3350.35ms, mfu 2.88%
+iter 460: loss 4.8014, time 3349.31ms, mfu 2.90%
+iter 470: loss 4.7095, time 3349.14ms, mfu 2.91%
+iter 480: loss 4.6348, time 3346.02ms, mfu 2.93%
+iter 490: loss 4.6421, time 3355.33ms, mfu 2.94%
+step 500: train loss 4.6491, val loss 5.7898
+saving checkpoint to out_fineweb
+iter 500: loss 4.6270, time 7516.25ms, mfu 2.78%
+iter 510: loss 4.7139, time 3357.39ms, mfu 2.81%
+iter 520: loss 4.6266, time 3347.93ms, mfu 2.83%
+iter 530: loss 4.5568, time 3360.27ms, mfu 2.85%
+iter 540: loss 4.4811, time 3355.84ms, mfu 2.87%
+iter 550: loss 4.4926, time 3345.08ms, mfu 2.89%
+iter 560: loss 4.4639, time 3356.51ms, mfu 2.90%
+iter 570: loss 4.5046, time 3377.74ms, mfu 2.91%
+iter 580: loss 4.5317, time 3367.41ms, mfu 2.92%
+iter 590: loss 4.4231, time 3360.27ms, mfu 2.94%
+step 600: train loss 4.3991, val loss 5.7944
+saving checkpoint to out_fineweb
+iter 600: loss 4.4102, time 7534.48ms, mfu 2.78%
+iter 610: loss 4.3858, time 3364.99ms, mfu 2.80%
+iter 620: loss 4.2846, time 3350.36ms, mfu 2.83%
+iter 630: loss 4.3395, time 3344.62ms, mfu 2.85%
+iter 640: loss 4.2886, time 3358.39ms, mfu 2.87%
+iter 650: loss 4.2907, time 3353.84ms, mfu 2.88%
+iter 660: loss 4.3060, time 3361.95ms, mfu 2.90%
+iter 670: loss 4.2536, time 3357.26ms, mfu 2.91%
+iter 680: loss 4.2402, time 3353.11ms, mfu 2.93%
+iter 690: loss 4.1435, time 3341.97ms, mfu 2.94%
+step 700: train loss 4.1655, val loss 5.9265
+saving checkpoint to out_fineweb
+iter 700: loss 4.1745, time 7683.79ms, mfu 2.78%
+iter 710: loss 4.0990, time 3340.11ms, mfu 2.80%
+iter 720: loss 4.1674, time 3335.44ms, mfu 2.83%
+iter 730: loss 4.1135, time 3349.60ms, mfu 2.85%
+iter 740: loss 4.0902, time 3343.72ms, mfu 2.87%
+iter 750: loss 4.0989, time 3331.32ms, mfu 2.89%
+iter 760: loss 4.0161, time 3348.92ms, mfu 2.91%
+iter 770: loss 3.9603, time 3341.01ms, mfu 2.92%
+iter 780: loss 4.0174, time 3340.40ms, mfu 2.93%
+iter 790: loss 4.0111, time 3346.65ms, mfu 2.94%
+step 800: train loss 3.9709, val loss 6.0781
+saving checkpoint to out_fineweb
+iter 800: loss 4.0737, time 7655.51ms, mfu 2.78%
+iter 810: loss 4.0373, time 3343.59ms, mfu 2.81%
+iter 820: loss 3.8996, time 3351.94ms, mfu 2.83%
+iter 830: loss 3.8831, time 3359.04ms, mfu 2.85%
+iter 840: loss 3.8974, time 3356.87ms, mfu 2.87%
+iter 850: loss 3.8860, time 3359.65ms, mfu 2.89%
+iter 860: loss 3.8020, time 3363.19ms, mfu 2.90%
+iter 870: loss 3.8097, time 3363.76ms, mfu 2.91%
+iter 880: loss 3.8800, time 3367.06ms, mfu 2.93%
+iter 890: loss 3.8533, time 3356.93ms, mfu 2.94%
+step 900: train loss 3.7721, val loss 6.1710
+saving checkpoint to out_fineweb
+iter 900: loss 3.8628, time 7535.09ms, mfu 2.78%
+iter 910: loss 3.8116, time 3364.82ms, mfu 2.80%
+iter 920: loss 3.6296, time 3372.71ms, mfu 2.83%
+iter 930: loss 3.7447, time 3343.88ms, mfu 2.85%
+iter 940: loss 3.7867, time 3352.17ms, mfu 2.87%
+iter 950: loss 3.6555, time 3338.23ms, mfu 2.89%
+iter 960: loss 3.6594, time 3338.58ms, mfu 2.90%
+iter 970: loss 3.6739, time 3337.96ms, mfu 2.92%
+iter 980: loss 3.6173, time 3328.56ms, mfu 2.93%
+iter 990: loss 3.6645, time 3322.20ms, mfu 2.95%
+step 1000: train loss 3.6315, val loss 6.3796
+saving checkpoint to out_fineweb
+iter 1000: loss 3.5860, time 7490.94ms, mfu 2.79%
