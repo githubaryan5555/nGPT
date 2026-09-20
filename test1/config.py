@@ -31,7 +31,7 @@ bias = False
 
 # ---------------------------- batching -------------------------
 batch_size = 256
-gradient_accumulation_steps = 64
+gradient_accumulation_steps = 16
 
 # --------------------------- optimizer -------------------------
 learning_rate = 1e-3
