@@ -1,54 +1,60 @@
+
 # config.py — every variable here is read AND used by train.py
 # edit this file instead of passing CLI flags
 
 # ---------------------------- I/O ----------------------------
-out_dir = 'out_fineweb'          # checkpoint output directory
-eval_interval = 100              # eval + checkpoint every N iters
-log_interval = 10                # log every N iters
-eval_iters = 25                  # batches per eval split
-eval_only = False                # if True, exit after first eval
-always_save_checkpoint = True    # save after every eval, not just on improvement
-init_from = 'scratch'            # 'scratch' | 'resume' | 'gpt2*'
+out_dir = 'out_fineweb20mb'
+eval_interval = 100
+log_interval = 10
+eval_iters = 25
+eval_only = False # if True, script exits right after the first eval
+always_save_checkpoint = True # if True, always save a checkpoint after each eval
+init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 
-# ---------------------------- wandb ----------------------------
+# ---------------------------- wandb --------------------------
 wandb_log = False
 wandb_project = 'owt'
-wandb_run_name = 'fw'
+wandb_run_name = 'fw20mb'
 
-# ---------------------------- data -----------------------------
-data_root = 'datasets'           # bins expected at datasets/<dataset>/*.bin or datasets/*.bin
-dataset = 'fineweb'              # subfolder name under data_root (falls back to data_root itself)
-preload_data_to_gpu = False      # if True and bins fit in VRAM, load tokens fully onto GPU (fastest loader)
+# ---------------------------- data ----------------------------
+data_root = 'datasets'
+dataset = 'fineweb20mb'
 
-# ---------------------------- model ----------------------------
+gradient_accumulation_steps = 4 * 4 # used to simulate larger batch sizes
+batch_size = 128 # micro-batch size
+block_size = 256
+
+# ---------------------------- model ---------------------------
 n_layer = 8
 n_head = 8
 n_embd = 256
-block_size = 256
-dropout = 0.0                    # 0.0 for pretraining, try 0.1+ for finetuning
-bias = False                     # bias inside LayerNorm and Linear layers?
+dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+bias = False # do we use bias inside LayerNorm and Linear layers?
 
-# ---------------------------- batching -------------------------
-batch_size = 64                  # micro-batch size
-gradient_accumulation_steps = 16 # effective batch = batch_size * grad_accum
-
-# --------------------------- optimizer -------------------------
-learning_rate = 1e-3             # max LR
-max_iters = 1000                 # total training iterations
+# ---------------------------- adamw optimizer -----------------
+learning_rate = 1e-3
+max_iters = 1000
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0                  # 0.0 disables
+grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 
-# ------------------------- LR schedule -------------------------
+# ------------------------- LR decay settings ------------------
 decay_lr = True
 warmup_iters = 50
-lr_decay_iters = 1000            # ~= max_iters per Chinchilla
-min_lr = 5e-4                    # ~= learning_rate/10 per Chinchilla
+lr_decay_iters = 1000
+min_lr = 5e-4
+
+# ---------------------------- DDP settings --------------------
+backend = 'nccl' # 'nccl', 'gloo', etc.
 
 # ---------------------------- system ---------------------------
-device = 'cuda'                  # 'cpu', 'cuda', 'cuda:0', ...
-dtype = 'auto'                   # 'auto' | 'float32' | 'bfloat16' | 'float16'
-compile = True                   # torch.compile the model
-compile_mode = 'default'         # 'default' | 'max-autotune' | 'max-autotune-no-cudagraphs' | ...
-seed = 1337
+device = 'cuda'
+
+dtype = (
+    'float16'
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    else 'float16'
+) # 'float32', 'bfloat16', or 'float16'
+
+compile = True # use PyTorch 2.0 to compile the model to be faster
