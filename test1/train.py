@@ -37,7 +37,7 @@ print(f"using dtype: {dtype}")
 device = C.device
 device_type = 'cuda' if 'cuda' in device else 'cpu'
 if device_type == 'cuda':
-    torch.cuda.set_device(device)
+    torch.cuda.set_device(0)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
