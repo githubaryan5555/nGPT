@@ -128,7 +128,7 @@ if requested_device.startswith("cuda"):
             "but CUDA is not available."
         )
 
-    device = torch.device(requested_device)
+    device = torch.device("cuda:0")
 
 elif requested_device == "cpu":
     device = torch.device("cpu")
