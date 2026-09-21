@@ -1,0 +1,3 @@
+train.py edited for single gpu , efficiency and dataloader simplicity
+new config.py
+datasets dir added
