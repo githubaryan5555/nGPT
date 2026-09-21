@@ -1,0 +1,246 @@
+passing 
+Dataset storage dtype: uint16
+train.bin: 5,042,694 tokens | sample max ID=8,191 | range OK
+val.bin: 563,280 tokens | sample max ID=8,191 | range OK
+======================================================================
+DATASET
+======================================================================
+directory       : datasets/fineweb20mb
+storage dtype   : uint16
+train tokens    : 5,042,694
+val tokens      : 563,280
+vocab size      : 8,192
+block size      : 256
+streaming       : enabled
+preload to GPU  : disabled
+======================================================================
+
+======================================================================
+TRAINING
+======================================================================
+device                  : cuda:0
+dtype                   : torch.float16
+AMP                     : True
+GradScaler              : True
+batch size              : 128
+gradient accumulation   : 16
+effective tokens/step   : 524,288
+learning rate           : 0.001
+max iterations          : 1,000
+compile                 : True
+======================================================================
+
+Initializing model from scratch.
+number of parameters: 29.37M
+number of parameters: 29,499,904 (29.50M)
+num decayed parameter tensors: 34, with 29,491,200 parameters
+num non-decayed parameter tensors: 17, with 8,704 parameters
+using fused AdamW: True
+compiling model with mode='default'...
+/content/nGPT/test1/train.py:576: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:213.)
+  torch.from_numpy(
+W0921 11:01:37.289000 536 torch/_inductor/utils.py:1731] [0/0] Not enough SMs to use max_autotune_gemm mode
+step 0: train loss 9.1071, val loss 9.1105
+iter 0: loss 9.1025, lr 1.96078e-05, time 46675.79ms, tok/s 11,233, mfu N/A
+iter 10: loss 7.9554, lr 0.000215686, time 6808.95ms, tok/s 77,000, mfu 4.66%
+iter 20: loss 7.2548, lr 0.000411765, time 6746.60ms, tok/s 77,711, mfu 4.66%
+iter 30: loss 6.9700, lr 0.000607843, time 6725.58ms, tok/s 77,954, mfu 4.67%
+iter 40: loss 6.6003, lr 0.000803922, time 6763.25ms, tok/s 77,520, mfu 4.67%
+iter 50: loss 6.3816, lr 0.001, time 6790.21ms, tok/s 77,212, mfu 4.67%
+iter 60: loss 6.1423, lr 0.000999863, time 6800.91ms, tok/s 77,091, mfu 4.67%
+iter 70: loss 6.0040, lr 0.000999453, time 6796.47ms, tok/s 77,141, mfu 4.67%
+iter 80: loss 5.9150, lr 0.000998771, time 6797.97ms, tok/s 77,124, mfu 4.67%
+iter 90: loss 5.8153, lr 0.000997816, time 6794.59ms, tok/s 77,163, mfu 4.67%
+step 100: train loss 5.6879, val loss 5.8232
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 100: loss 5.6741, lr 0.00099659, time 19613.74ms, tok/s 26,731, mfu 4.36%
+iter 110: loss 5.5942, lr 0.000995095, time 6733.93ms, tok/s 77,858, mfu 4.40%
+iter 120: loss 5.4930, lr 0.000993332, time 6802.48ms, tok/s 77,073, mfu 4.43%
+iter 130: loss 5.4591, lr 0.000991302, time 6792.16ms, tok/s 77,190, mfu 4.45%
+iter 140: loss 5.2942, lr 0.000989009, time 6810.80ms, tok/s 76,979, mfu 4.47%
+iter 150: loss 5.2068, lr 0.000986454, time 6793.60ms, tok/s 77,174, mfu 4.49%
+iter 160: loss 5.2363, lr 0.000983641, time 6799.23ms, tok/s 77,110, mfu 4.51%
+iter 170: loss 5.1091, lr 0.000980572, time 6807.68ms, tok/s 77,014, mfu 4.52%
+iter 180: loss 5.0310, lr 0.000977252, time 6818.72ms, tok/s 76,890, mfu 4.54%
+iter 190: loss 4.9376, lr 0.000973682, time 6795.87ms, tok/s 77,148, mfu 4.55%
+step 200: train loss 4.9376, val loss 5.1868
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 200: loss 4.9314, lr 0.000969868, time 20679.40ms, tok/s 25,353, mfu 4.25%
+iter 210: loss 4.7639, lr 0.000965814, time 6739.34ms, tok/s 77,795, mfu 4.29%
+iter 220: loss 4.7663, lr 0.000961524, time 6766.90ms, tok/s 77,478, mfu 4.33%
+iter 230: loss 4.6812, lr 0.000957002, time 6801.74ms, tok/s 77,081, mfu 4.37%
+iter 240: loss 4.6146, lr 0.000952254, time 6808.25ms, tok/s 77,008, mfu 4.40%
+iter 250: loss 4.6146, lr 0.000947285, time 6815.18ms, tok/s 76,929, mfu 4.42%
+iter 260: loss 4.5536, lr 0.0009421, time 6819.32ms, tok/s 76,883, mfu 4.44%
+iter 270: loss 4.4114, lr 0.000936705, time 6817.13ms, tok/s 76,907, mfu 4.47%
+iter 280: loss 4.4333, lr 0.000931106, time 6780.42ms, tok/s 77,324, mfu 4.49%
+iter 290: loss 4.3632, lr 0.000925309, time 6809.81ms, tok/s 76,990, mfu 4.50%
+step 300: train loss 4.2942, val loss 4.7798
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 300: loss 4.2998, lr 0.00091932, time 20943.96ms, tok/s 25,033, mfu 4.21%
+iter 310: loss 4.2659, lr 0.000913146, time 6774.14ms, tok/s 77,396, mfu 4.25%
+iter 320: loss 4.2172, lr 0.000906794, time 6812.64ms, tok/s 76,958, mfu 4.29%
+iter 330: loss 4.1428, lr 0.00090027, time 6791.09ms, tok/s 77,202, mfu 4.33%
+iter 340: loss 4.0842, lr 0.000893582, time 6846.55ms, tok/s 76,577, mfu 4.36%
+iter 350: loss 4.1208, lr 0.000886737, time 6803.09ms, tok/s 77,066, mfu 4.39%
+iter 360: loss 3.9401, lr 0.000879742, time 6794.42ms, tok/s 77,164, mfu 4.42%
+iter 370: loss 3.9421, lr 0.000872606, time 6813.07ms, tok/s 76,953, mfu 4.44%
+iter 380: loss 3.9275, lr 0.000865335, time 6818.42ms, tok/s 76,893, mfu 4.46%
+iter 390: loss 3.9134, lr 0.000857939, time 6798.89ms, tok/s 77,114, mfu 4.48%
+step 400: train loss 3.7944, val loss 4.6730
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 400: loss 3.7601, lr 0.000850424, time 20494.58ms, tok/s 25,582, mfu 4.19%
+iter 410: loss 3.7697, lr 0.000842799, time 6735.30ms, tok/s 77,842, mfu 4.24%
+iter 420: loss 3.6701, lr 0.000835073, time 6802.85ms, tok/s 77,069, mfu 4.28%
+iter 430: loss 3.6830, lr 0.000827254, time 6795.16ms, tok/s 77,156, mfu 4.32%
+iter 440: loss 3.6223, lr 0.000819351, time 6792.61ms, tok/s 77,185, mfu 4.36%
+iter 450: loss 3.5465, lr 0.000811371, time 6831.96ms, tok/s 76,741, mfu 4.39%
+iter 460: loss 3.4723, lr 0.000803325, time 6811.81ms, tok/s 76,968, mfu 4.41%
+iter 470: loss 3.4486, lr 0.00079522, time 6802.35ms, tok/s 77,075, mfu 4.44%
+iter 480: loss 3.4531, lr 0.000787066, time 6792.68ms, tok/s 77,184, mfu 4.46%
+iter 490: loss 3.3474, lr 0.000778871, time 6794.63ms, tok/s 77,162, mfu 4.48%
+step 500: train loss 3.3182, val loss 4.8450
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 500: loss 3.3190, lr 0.000770645, time 19700.24ms, tok/s 26,613, mfu 4.20%
+iter 510: loss 3.2257, lr 0.000762396, time 6759.36ms, tok/s 77,565, mfu 4.25%
+iter 520: loss 3.1524, lr 0.000754133, time 6836.08ms, tok/s 76,694, mfu 4.28%
+iter 530: loss 3.1416, lr 0.000745867, time 6800.67ms, tok/s 77,094, mfu 4.32%
+iter 540: loss 3.1113, lr 0.000737604, time 6808.47ms, tok/s 77,005, mfu 4.36%
+iter 550: loss 3.0275, lr 0.000729355, time 6805.89ms, tok/s 77,034, mfu 4.39%
+iter 560: loss 3.0088, lr 0.000721129, time 6814.83ms, tok/s 76,933, mfu 4.41%
+iter 570: loss 2.8978, lr 0.000712934, time 6812.64ms, tok/s 76,958, mfu 4.44%
+iter 580: loss 2.9129, lr 0.00070478, time 6803.04ms, tok/s 77,067, mfu 4.46%
+iter 590: loss 2.8168, lr 0.000696675, time 6805.44ms, tok/s 77,040, mfu 4.48%
+step 600: train loss 2.7455, val loss 5.1693
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 600: loss 2.7949, lr 0.000688629, time 19764.27ms, tok/s 26,527, mfu 4.19%
+iter 610: loss 2.7766, lr 0.000680649, time 6793.17ms, tok/s 77,179, mfu 4.24%
+iter 620: loss 2.5562, lr 0.000672746, time 6838.64ms, tok/s 76,666, mfu 4.28%
+iter 630: loss 2.6523, lr 0.000664927, time 6805.36ms, tok/s 77,040, mfu 4.32%
+iter 640: loss 2.5718, lr 0.000657201, time 6809.44ms, tok/s 76,994, mfu 4.35%
+iter 650: loss 2.5089, lr 0.000649576, time 6795.81ms, tok/s 77,149, mfu 4.38%
+iter 660: loss 2.4188, lr 0.000642061, time 6805.10ms, tok/s 77,043, mfu 4.41%
+iter 670: loss 2.4144, lr 0.000634665, time 6807.89ms, tok/s 77,012, mfu 4.44%
+iter 680: loss 2.3493, lr 0.000627394, time 6801.09ms, tok/s 77,089, mfu 4.46%
+iter 690: loss 2.2390, lr 0.000620258, time 6805.90ms, tok/s 77,034, mfu 4.48%
+step 700: train loss 2.2331, val loss 5.6379
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 700: loss 2.2231, lr 0.000613263, time 19882.42ms, tok/s 26,369, mfu 4.19%
+iter 710: loss 2.2260, lr 0.000606418, time 6757.09ms, tok/s 77,591, mfu 4.24%
+iter 720: loss 2.1503, lr 0.00059973, time 6796.91ms, tok/s 77,136, mfu 4.28%
+iter 730: loss 2.1666, lr 0.000593206, time 6800.96ms, tok/s 77,090, mfu 4.32%
+iter 740: loss 2.0160, lr 0.000586854, time 6798.16ms, tok/s 77,122, mfu 4.36%
+iter 750: loss 2.0782, lr 0.00058068, time 6796.17ms, tok/s 77,145, mfu 4.39%
+iter 760: loss 1.9986, lr 0.000574691, time 6852.00ms, tok/s 76,516, mfu 4.41%
+iter 770: loss 1.8500, lr 0.000568894, time 6822.44ms, tok/s 76,848, mfu 4.44%
+iter 780: loss 1.8528, lr 0.000563295, time 6797.25ms, tok/s 77,132, mfu 4.46%
+iter 790: loss 1.7695, lr 0.0005579, time 6805.91ms, tok/s 77,034, mfu 4.48%
+step 800: train loss 1.7794, val loss 6.1563
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 800: loss 1.8125, lr 0.000552715, time 20121.09ms, tok/s 26,057, mfu 4.19%
+iter 810: loss 1.7694, lr 0.000547746, time 6750.42ms, tok/s 77,667, mfu 4.24%
+iter 820: loss 1.7676, lr 0.000542998, time 6813.82ms, tok/s 76,945, mfu 4.28%
+iter 830: loss 1.6376, lr 0.000538476, time 6801.14ms, tok/s 77,088, mfu 4.32%
+iter 840: loss 1.6441, lr 0.000534186, time 6811.56ms, tok/s 76,970, mfu 4.35%
+iter 850: loss 1.6257, lr 0.000530132, time 6816.79ms, tok/s 76,911, mfu 4.38%
+iter 860: loss 1.6001, lr 0.000526318, time 6807.08ms, tok/s 77,021, mfu 4.41%
+iter 870: loss 1.5435, lr 0.000522748, time 6803.93ms, tok/s 77,057, mfu 4.44%
+iter 880: loss 1.5649, lr 0.000519428, time 6805.29ms, tok/s 77,041, mfu 4.46%
+iter 890: loss 1.4882, lr 0.000516359, time 6791.92ms, tok/s 77,193, mfu 4.48%
+step 900: train loss 1.4386, val loss 6.6424
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 900: loss 1.4647, lr 0.000513546, time 19925.54ms, tok/s 26,312, mfu 4.19%
+iter 910: loss 1.4299, lr 0.000510991, time 6734.80ms, tok/s 77,848, mfu 4.24%
+iter 920: loss 1.3462, lr 0.000508698, time 6810.29ms, tok/s 76,985, mfu 4.28%
+iter 930: loss 1.3726, lr 0.000506668, time 6792.60ms, tok/s 77,185, mfu 4.32%
+iter 940: loss 1.3252, lr 0.000504905, time 6794.91ms, tok/s 77,159, mfu 4.36%
+iter 950: loss 1.2932, lr 0.00050341, time 6833.92ms, tok/s 76,718, mfu 4.39%
+iter 960: loss 1.2642, lr 0.000502184, time 6813.17ms, tok/s 76,952, mfu 4.41%
+iter 970: loss 1.2841, lr 0.000501229, time 6808.67ms, tok/s 77,003, mfu 4.44%
+iter 980: loss 1.2258, lr 0.000500547, time 6799.87ms, tok/s 77,103, mfu 4.46%
+iter 990: loss 1.1929, lr 0.000500137, time 6802.23ms, tok/s 77,076, mfu 4.48%
+
+Training finished.
+
+
+     ======================================================================
+MODEL SAMPLER
+======================================================================
+Checkpoint : out_fineweb20mb/ckpt.pt
+Tokenizer  : datasets/fineweb20mb/tokenizer.json
+Device     : cuda
+Vocabulary : 8,192
+
+Loading checkpoint...
+
+Checkpoint type: <class 'dict'>
+Checkpoint keys:
+   model
+   optimizer
+   model_args
+   iter_num
+   best_val_loss
+   config
+
+Model configuration found in checkpoint:
+  out_dir: out_fineweb20mb
+  eval_interval: 100
+  log_interval: 10
+  eval_iters: 25
+  eval_only: False
+  always_save_checkpoint: True
+  init_from: scratch
+  wandb_log: False
+  wandb_project: owt
+  wandb_run_name: fw20mb
+  data_root: datasets
+  dataset: fineweb20mb
+  preload_data_to_gpu: False
+  vocab_size: 8192
+  n_layer: 8
+  n_head: 16
+  n_embd: 512
+  block_size: 256
+  dropout: 0.0
+  bias: False
+  batch_size: 128
+  gradient_accumulation_steps: 16
+  learning_rate: 0.001
+  max_iters: 1000
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  decay_lr: True
+  warmup_iters: 50
+  lr_decay_iters: 1000
+  min_lr: 0.0005
+  device: cuda
+  dtype: float16
+  compile: True
+  compile_mode: default
+  seed: 1337
+number of parameters: 29.37M
+
+Parameters : 29,499,904
+Block size : 256
+Device     : cuda
+
+======================================================================
+PROMPT
+======================================================================
+The
+
+======================================================================
+GENERATING
+======================================================================
+The CC2. So in the redesign of the Rewards' line can come from it is. But the Rams are going to be doing something for me.As we got up on the ballpark, I can drain my ball on the ball toss and stand around it. I can have some daggers but I can still displaying my ear the dot and even I can't see what went wrong. A big bit of dagger yet.
+I can't talk about how Shaw. One thought I've gotten is "but if I have" I can hold it along before, just mark the first and then it on the previous game the moment. The first six steps! So we're back to marked on bothiving line. It's not so bad, it's just a matter of mind. The power it's going to go out and talk to one more reception on the ground priority. And all this is going to happen
+
+======================================================================
+INFO
+======================================================================
+Input tokens     : 1
+Output tokens    : 201
+New tokens       : 200
+'The CC2. So in the redesign of the Rewards\' line can come from it is. But the Rams are going to be doing something for me.As we got up on the ballpark, I can drain my ball on the ball toss and stand around it. I can have some daggers but I can still displaying my ear the dot and even I can\'t see what went wrong. A big bit of dagger yet.\nI can\'t talk about how Shaw. One thought I\'ve gotten is "but if I have" I can hold it along before, just mark the first and then it on the previous game the moment. The first six steps! So we\'re back to marked on bothiving line. It\'s not so bad, it\'s just a matter of mind. The power it\'s going to go out and talk to one more reception on the ground priority. And all this is going to happen'
