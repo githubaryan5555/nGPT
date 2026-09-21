@@ -1,0 +1,145 @@
+FAIL
+13.3/15 GB vram
+Cloning into 'nGPT'...
+remote: Enumerating objects: 904, done.
+remote: Counting objects: 100% (120/120), done.
+remote: Compressing objects: 100% (59/59), done.
+remote: Total 904 (delta 82), reused 55 (delta 55), pack-reused 784 (from 3)
+Receiving objects: 100% (904/904), 8.19 MiB | 17.80 MiB/s, done.
+Resolving deltas: 100% (481/481), done.
+/content/nGPT/test2/nGPT/test2
+Dataset storage dtype: uint16
+train.bin: 5,042,694 tokens | sample max ID=8,191 | range OK
+val.bin: 563,280 tokens | sample max ID=8,191 | range OK
+======================================================================
+DATASET
+======================================================================
+directory       : datasets/fineweb20mb
+storage dtype   : uint16
+train tokens    : 5,042,694
+val tokens      : 563,280
+vocab size      : 8,192
+block size      : 256
+streaming       : enabled
+preload to GPU  : disabled
+======================================================================
+
+======================================================================
+TRAINING
+======================================================================
+device                  : cuda:0
+dtype                   : torch.float16
+AMP                     : True
+GradScaler              : True
+batch size              : 64
+gradient accumulation   : 16
+effective tokens/step   : 262,144
+learning rate           : 0.001
+max iterations          : 250
+compile                 : False
+======================================================================
+
+Initializing model from scratch.
+number of parameters: 29.40M
+number of parameters: 29,532,928 (29.53M)
+num decayed parameter tensors: 66, with 29,491,200 parameters
+num non-decayed parameter tensors: 97, with 41,728 parameters
+using fused AdamW: True
+/content/nGPT/test2/nGPT/test2/train.py:576: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:213.)
+  torch.from_numpy(
+step 0: train loss 9.1139, val loss 9.1164
+iter 0: loss 9.1116, lr 1.96078e-05, time 19851.90ms, tok/s 13,205, mfu N/A
+iter 5: loss 8.5103, lr 0.000117647, time 9761.87ms, tok/s 26,854, mfu 1.63%
+iter 10: loss 8.1092, lr 0.000215686, time 9199.61ms, tok/s 28,495, mfu 1.64%
+iter 15: loss 7.6638, lr 0.000313725, time 9255.12ms, tok/s 28,324, mfu 1.64%
+iter 20: loss 7.3819, lr 0.000411765, time 9214.24ms, tok/s 28,450, mfu 1.65%
+iter 25: loss 7.2655, lr 0.000509804, time 9234.80ms, tok/s 28,387, mfu 1.66%
+iter 30: loss 7.1633, lr 0.000607843, time 9258.83ms, tok/s 28,313, mfu 1.66%
+iter 35: loss 7.1578, lr 0.000705882, time 9292.49ms, tok/s 28,210, mfu 1.67%
+iter 40: loss 7.0143, lr 0.000803922, time 9298.43ms, tok/s 28,192, mfu 1.67%
+iter 45: loss 6.9273, lr 0.000901961, time 9297.90ms, tok/s 28,194, mfu 1.68%
+step 50: train loss 6.7585, val loss 6.8373
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 50: loss 6.7801, lr 0.001, time 27215.76ms, tok/s 9,632, mfu 1.57%
+iter 55: loss 6.6017, lr 0.000999229, time 9287.55ms, tok/s 28,225, mfu 1.58%
+iter 60: loss 6.5027, lr 0.000996922, time 9301.06ms, tok/s 28,184, mfu 1.59%
+iter 65: loss 6.3331, lr 0.000993092, time 9295.78ms, tok/s 28,200, mfu 1.61%
+iter 70: loss 6.2921, lr 0.000987764, time 9290.88ms, tok/s 28,215, mfu 1.62%
+iter 75: loss 6.1051, lr 0.00098097, time 9299.72ms, tok/s 28,188, mfu 1.62%
+iter 80: loss 6.0463, lr 0.000972752, time 9301.81ms, tok/s 28,182, mfu 1.63%
+iter 85: loss 6.0212, lr 0.00096316, time 9263.09ms, tok/s 28,300, mfu 1.64%
+iter 90: loss nan, lr 0.000952254, time 9178.15ms, tok/s 28,562, mfu 1.65%
+iter 95: loss nan, lr 0.000940101, time 9091.26ms, tok/s 28,835, mfu 1.66%
+step 100: train loss nan, val loss nan
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 100: loss 6.0267, lr 0.000926777, time 26617.92ms, tok/s 9,848, mfu 1.55%
+iter 105: loss 6.0000, lr 0.000912362, time 8933.80ms, tok/s 29,343, mfu 1.58%
+iter 110: loss nan, lr 0.000896946, time 8927.10ms, tok/s 29,365, mfu 1.60%
+iter 115: loss nan, lr 0.000880625, time 8928.87ms, tok/s 29,359, mfu 1.61%
+iter 120: loss nan, lr 0.000863498, time 8897.27ms, tok/s 29,463, mfu 1.63%
+iter 125: loss nan, lr 0.000845671, time 8934.05ms, tok/s 29,342, mfu 1.65%
+iter 130: loss nan, lr 0.000827254, time 8934.56ms, tok/s 29,340, mfu 1.66%
+iter 135: loss nan, lr 0.000808361, time 8933.26ms, tok/s 29,345, mfu 1.67%
+iter 140: loss 5.9703, lr 0.000789109, time 8933.31ms, tok/s 29,345, mfu 1.68%
+iter 145: loss 5.9565, lr 0.000769615, time 8931.10ms, tok/s 29,352, mfu 1.69%
+step 150: train loss nan, val loss nan
+saving checkpoint to out_fineweb20mb/ckpt.pt
+iter 150: loss nan, lr 0.00075, time 25732.68ms, tok/s 10,187, mfu 1.58%
+iter 155: loss nan, lr 0.000730385, time 8932.15ms, tok/s 29,348, mfu 1.60%
+Traceback (most recent call last):
+  File "/content/nGPT/test2/nGPT/test2/train.py", line 1085, in <module>
+    ).backward()
+      ~~~~~~~~^^
+  File "/usr/local/lib/python3.13/dist-packages/torch/_tensor.py", line 631, in backward
+    torch.autograd.backward(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        self, gradient, retain_graph, create_graph, inputs=inputs
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/usr/local/lib/python3.13/dist-packages/torch/autograd/__init__.py", line 381, in backward
+    _engine_run_backward(
+    ~~~~~~~~~~~~~~~~~~~~^
+        tensors,
+        ^^^^^^^^
+    ...<5 lines>...
+        accumulate_grad=True,
+        ^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/usr/local/lib/python3.13/dist-packages/torch/autograd/graph.py", line 869, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        t_outputs, *args, **kwargs
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )  # Calls into the C++ engine to run the backward pass
+    ^
+KeyboardInterrupt
+
+number of parameters: 29.40M
+Model loaded: 29.53M parameters
+Device: cuda
+Prompt: 'The'
+/content/nGPT/test2/nGPT/test2/model.py:89: UserWarning: 
+################################################################################
+
+                                      Note
+The GPT-mode forward() should only be called when we are training models.
+Now we are using it for inference for simplicity, which works, but will be very inefficient.
+
+################################################################################
+
+  warnings.warn(f'\n{"#"*80}\n\n{" "*38}Note\nThe GPT-mode forward() should only be called when we are training models.\nNow we are using it for inference for simplicity, which works, but will be very inefficient.\n\n{"#"*80}\n')
+
+============================================================
+GENERATED
+============================================================
+�âĢľ2udleyĠ(ĠN'1�
+============================================================
+
+============================================================
+VRAM
+============================================================
+Allocated : 0.45 GB
+Reserved  : 0.50 GB
+Peak      : 0.47 GB
