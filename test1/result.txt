@@ -1,4 +1,4 @@
-passing 
+passing 7/15 GB vram google collab Tesla T4
 Dataset storage dtype: uint16
 train.bin: 5,042,694 tokens | sample max ID=8,191 | range OK
 val.bin: 563,280 tokens | sample max ID=8,191 | range OK
