@@ -3,8 +3,8 @@
 
 # ---------------------------- I/O ----------------------------
 out_dir = 'out_fineweb20mb'
-eval_interval = 100
-log_interval = 10
+eval_interval = 50
+log_interval = 5
 eval_iters = 25
 eval_only = False
 always_save_checkpoint = True
@@ -35,7 +35,7 @@ gradient_accumulation_steps = 16
 
 # --------------------------- optimizer -------------------------
 learning_rate = 1e-3
-max_iters = 1000
+max_iters = 250
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -44,7 +44,7 @@ grad_clip = 1.0
 # ------------------------- LR schedule -------------------------
 decay_lr = True
 warmup_iters = 50
-lr_decay_iters = 1000
+lr_decay_iters = 250
 min_lr = 5e-4
 
 # ---------------------------- system ---------------------------
