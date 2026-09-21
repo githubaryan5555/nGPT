@@ -1,5 +1,5 @@
 """
-Single-GPU training script.
+Single-GPU model-agnostic training script.
 
 All user-configurable settings live in config.py.
 
@@ -17,20 +17,38 @@ test1/
         ├── tokenizer.json
         └── tokenizer_config.json
 
-The .bin files must already contain token IDs.
-The tokenizer is NOT used during training.
+MODEL CONTRACT
+--------------
+
+The trainer does not know what architecture is being trained.
+
+The model only needs to satisfy:
+
+    model(X, Y) -> (logits, loss)
+
+where:
+
+    X      : [batch, sequence]
+    Y      : [batch, sequence]
+    logits : [batch, sequence, vocab_size]
+    loss   : scalar tensor
+
+The model may be a Transformer, RWKV, MLP, SSM, CNN,
+custom architecture, etc.
+
+Model construction is completely controlled by config.py.
 """
 
 import os
 import time
 import math
 import json
+import inspect
+import importlib
 from contextlib import nullcontext
 
 import numpy as np
 import torch
-
-from model import GPTConfig, GPT
 
 
 # =============================================================================
@@ -39,26 +57,34 @@ from model import GPTConfig, GPT
 
 import config as user_config
 
-_config_keys = [
-    k for k, v in vars(user_config).items()
-    if not k.startswith("_")
-    and isinstance(v, (int, float, bool, str))
-]
 
+# Keep arbitrary config objects.
+
+# The old trainer only accepted int/float/bool/str.
+# That prevented things such as:
+#
+#     model_kwargs = {...}
+#
+# from being used.
+#
+# Private names are still ignored.
 config = {
-    k: getattr(user_config, k)
-    for k in _config_keys
+    k: v
+    for k, v in vars(user_config).items()
+    if not k.startswith("_")
 }
 
 globals().update(config)
 
 
 # =============================================================================
-# Basic configuration validation
+# Configuration helpers
 # =============================================================================
 
 def fail(message):
-    raise RuntimeError(f"\nCONFIGURATION ERROR:\n{message}\n")
+    raise RuntimeError(
+        f"\nCONFIGURATION ERROR:\n{message}\n"
+    )
 
 
 def require(condition, message):
@@ -66,52 +92,152 @@ def require(condition, message):
         fail(message)
 
 
-require(vocab_size > 0, "vocab_size must be > 0.")
-require(n_layer > 0, "n_layer must be > 0.")
-require(n_head > 0, "n_head must be > 0.")
-require(n_embd > 0, "n_embd must be > 0.")
-require(block_size > 0, "block_size must be > 0.")
+# =============================================================================
+# Required generic training configuration
+# =============================================================================
 
-require(batch_size > 0, "batch_size must be > 0.")
+required_config = [
+    "vocab_size",
+    "block_size",
+    "batch_size",
+    "gradient_accumulation_steps",
+    "max_iters",
+    "eval_iters",
+    "eval_interval",
+    "log_interval",
+    "learning_rate",
+    "weight_decay",
+    "beta1",
+    "beta2",
+    "grad_clip",
+    "decay_lr",
+    "warmup_iters",
+    "lr_decay_iters",
+    "min_lr",
+    "init_from",
+    "preload_data_to_gpu",
+    "device",
+    "dtype",
+    "seed",
+    "data_root",
+    "dataset",
+    "out_dir",
+    "compile",
+    "compile_mode",
+    "eval_only",
+    "always_save_checkpoint",
+    "wandb_log",
+    "wandb_project",
+    "wandb_run_name",
+]
+
+
+for name in required_config:
+    require(
+        name in config,
+        f"Missing required config variable: {name}"
+    )
+
+
+# =============================================================================
+# Basic validation
+# =============================================================================
+
+require(
+    vocab_size > 0,
+    "vocab_size must be > 0."
+)
+
+require(
+    block_size > 0,
+    "block_size must be > 0."
+)
+
+require(
+    batch_size > 0,
+    "batch_size must be > 0."
+)
+
 require(
     gradient_accumulation_steps > 0,
     "gradient_accumulation_steps must be > 0."
 )
 
-require(max_iters >= 0, "max_iters must be >= 0.")
-require(eval_iters > 0, "eval_iters must be > 0.")
-require(eval_interval > 0, "eval_interval must be > 0.")
-require(log_interval > 0, "log_interval must be > 0.")
+require(
+    max_iters >= 0,
+    "max_iters must be >= 0."
+)
 
-require(learning_rate > 0, "learning_rate must be > 0.")
-require(weight_decay >= 0, "weight_decay must be >= 0.")
-require(0 <= beta1 < 1, "beta1 must be in [0, 1).")
-require(0 <= beta2 < 1, "beta2 must be in [0, 1).")
+require(
+    eval_iters > 0,
+    "eval_iters must be > 0."
+)
 
-if grad_clip < 0:
-    fail("grad_clip must be >= 0.")
+require(
+    eval_interval > 0,
+    "eval_interval must be > 0."
+)
 
-if decay_lr:
-    require(warmup_iters >= 0, "warmup_iters must be >= 0.")
-    require(lr_decay_iters > warmup_iters,
-            "lr_decay_iters must be greater than warmup_iters.")
-    require(min_lr >= 0, "min_lr must be >= 0.")
-    require(min_lr <= learning_rate,
-            "min_lr must be <= learning_rate.")
+require(
+    log_interval > 0,
+    "log_interval must be > 0."
+)
 
-require(init_from in {"scratch", "resume"},
-        "init_from must be either 'scratch' or 'resume'.")
+require(
+    learning_rate > 0,
+    "learning_rate must be > 0."
+)
+
+require(
+    weight_decay >= 0,
+    "weight_decay must be >= 0."
+)
+
+require(
+    0 <= beta1 < 1,
+    "beta1 must be in [0, 1)."
+)
+
+require(
+    0 <= beta2 < 1,
+    "beta2 must be in [0, 1)."
+)
+
+require(
+    grad_clip >= 0,
+    "grad_clip must be >= 0."
+)
+
+require(
+    init_from in {"scratch", "resume"},
+    "init_from must be either 'scratch' or 'resume'."
+)
 
 require(
     isinstance(preload_data_to_gpu, bool),
     "preload_data_to_gpu must be True or False."
 )
 
-if preload_data_to_gpu:
-    print(
-        "WARNING: preload_data_to_gpu=True requests full dataset "
-        "preloading, which is intentionally disabled for the general "
-        "streaming loader."
+if decay_lr:
+
+    require(
+        warmup_iters >= 0,
+        "warmup_iters must be >= 0."
+    )
+
+    require(
+        lr_decay_iters > warmup_iters,
+        "lr_decay_iters must be greater than warmup_iters."
+    )
+
+    require(
+        min_lr >= 0,
+        "min_lr must be >= 0."
+    )
+
+    require(
+        min_lr <= learning_rate,
+        "min_lr must be <= learning_rate."
     )
 
 
@@ -121,28 +247,41 @@ if preload_data_to_gpu:
 
 requested_device = str(device)
 
+
 if requested_device.startswith("cuda"):
-    if not torch.cuda.is_available():
-        fail(
+
+    require(
+        torch.cuda.is_available(),
+        (
             f"config requests device='{requested_device}', "
             "but CUDA is not available."
         )
+    )
 
     device = torch.device("cuda:0")
 
+
 elif requested_device == "cpu":
+
     device = torch.device("cpu")
 
+
 elif requested_device.startswith("mps"):
-    if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
-        fail(
+
+    require(
+        hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available(),
+        (
             f"config requests device='{requested_device}', "
             "but MPS is not available."
         )
+    )
 
     device = torch.device(requested_device)
 
+
 else:
+
     fail(
         f"Unsupported device '{requested_device}'. "
         "Use 'cuda', 'cuda:0', 'cpu', or 'mps'."
@@ -158,67 +297,74 @@ using_cuda = device_type == "cuda"
 # =============================================================================
 
 if using_cuda:
+
     torch.cuda.set_device(device)
 
-    # These are safe performance settings for modern NVIDIA GPUs.
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    # Let cuDNN benchmark choose kernels when shapes stay fixed.
     torch.backends.cudnn.benchmark = True
 
 
 # =============================================================================
-# Dtype / AMP configuration
+# Dtype / AMP
 # =============================================================================
 
 requested_dtype = str(dtype).lower()
 
-if requested_dtype not in {
-    "auto",
-    "float32",
-    "fp32",
-    "float16",
-    "fp16",
-    "bfloat16",
-    "bf16",
-}:
-    fail(
+
+require(
+    requested_dtype in {
+        "auto",
+        "float32",
+        "fp32",
+        "float16",
+        "fp16",
+        "bfloat16",
+        "bf16",
+    },
+    (
         f"Unsupported dtype='{dtype}'. "
-        "Use 'auto', 'float32', 'float16', or 'bfloat16'."
+        "Use auto, float32, float16, or bfloat16."
     )
+)
 
 
 def choose_dtype():
+
     if requested_dtype in {"float32", "fp32"}:
         return torch.float32
 
+
     if requested_dtype in {"float16", "fp16"}:
-        if not using_cuda:
-            print(
-                "WARNING: float16 AMP is not used on CPU. "
-                "Falling back to float32."
-            )
-            return torch.float32
+
+        require(
+            using_cuda,
+            "float16 training requires CUDA."
+        )
 
         return torch.float16
 
-    if requested_dtype in {"bfloat16", "bf16"}:
-        if using_cuda:
-            if not torch.cuda.is_bf16_supported():
-                fail(
-                    "dtype='bfloat16' was requested, but this CUDA "
-                    "device does not report BF16 support."
-                )
-            return torch.bfloat16
 
-        # CPU BF16 support depends on the actual CPU/PyTorch build.
-        # PyTorch can generally execute BF16 CPU operations, but it may
-        # be substantially slower than FP32.
+    if requested_dtype in {"bfloat16", "bf16"}:
+
+        if using_cuda:
+
+            require(
+                torch.cuda.is_bf16_supported(),
+                (
+                    "dtype='bfloat16' was requested, "
+                    "but this CUDA device does not report BF16 support."
+                )
+            )
+
         return torch.bfloat16
 
+
     # auto
+
     if using_cuda:
+
         if torch.cuda.is_bf16_supported():
             return torch.bfloat16
 
@@ -229,12 +375,13 @@ def choose_dtype():
 
 ptdtype = choose_dtype()
 
-if ptdtype == torch.float16 and not using_cuda:
-    fail("float16 training requires CUDA in this training script.")
 
+# =============================================================================
+# Autocast
+# =============================================================================
 
-# AMP is useful for CUDA. CPU BF16 uses autocast as well.
 if device_type == "cuda":
+
     autocast_enabled = ptdtype in {
         torch.float16,
         torch.bfloat16,
@@ -250,21 +397,32 @@ if device_type == "cuda":
         else nullcontext()
     )
 
+
 elif device_type == "cpu" and ptdtype == torch.bfloat16:
+
+    autocast_enabled = True
+
     autocast_context = torch.autocast(
         device_type="cpu",
         dtype=torch.bfloat16,
     )
 
+
 else:
+
+    autocast_enabled = False
     autocast_context = nullcontext()
 
 
-# GradScaler is required/useful for FP16, but NOT BF16.
+# =============================================================================
+# GradScaler
+# =============================================================================
+
 use_grad_scaler = (
     using_cuda
     and ptdtype == torch.float16
 )
+
 
 scaler = torch.amp.GradScaler(
     "cuda",
@@ -291,11 +449,31 @@ data_dir = os.path.join(
     str(dataset),
 )
 
-train_path = os.path.join(data_dir, "train.bin")
-val_path = os.path.join(data_dir, "val.bin")
-dataset_config_path = os.path.join(data_dir, "dataset_config.json")
-tokenizer_config_path = os.path.join(data_dir, "tokenizer_config.json")
-tokenizer_path = os.path.join(data_dir, "tokenizer.json")
+train_path = os.path.join(
+    data_dir,
+    "train.bin",
+)
+
+val_path = os.path.join(
+    data_dir,
+    "val.bin",
+)
+
+dataset_config_path = os.path.join(
+    data_dir,
+    "dataset_config.json",
+)
+
+tokenizer_config_path = os.path.join(
+    data_dir,
+    "tokenizer_config.json",
+)
+
+tokenizer_path = os.path.join(
+    data_dir,
+    "tokenizer.json",
+)
+
 
 require(
     os.path.isdir(data_dir),
@@ -319,24 +497,32 @@ require(
 
 dataset_config = {}
 
+
 if os.path.isfile(dataset_config_path):
+
     try:
-        with open(dataset_config_path, "r", encoding="utf-8") as f:
+
+        with open(
+            dataset_config_path,
+            "r",
+            encoding="utf-8",
+        ) as f:
+
             dataset_config = json.load(f)
+
     except Exception as e:
+
         fail(
             f"Could not read dataset_config.json:\n{e}"
         )
 
 
 # =============================================================================
-# Determine token storage dtype
+# Dataset dtype
 # =============================================================================
 
 def normalize_numpy_dtype(value):
-    """
-    Convert a metadata dtype string into a NumPy dtype.
-    """
+
     if value is None:
         return None
 
@@ -356,9 +542,7 @@ def normalize_numpy_dtype(value):
 
 
 def find_dataset_dtype(metadata):
-    """
-    Look for common dtype field names in dataset_config.json.
-    """
+
     if not isinstance(metadata, dict):
         return None
 
@@ -371,7 +555,9 @@ def find_dataset_dtype(metadata):
     ]
 
     for candidate in candidates:
+
         dtype_value = normalize_numpy_dtype(candidate)
+
         if dtype_value is not None:
             return dtype_value
 
@@ -380,24 +566,19 @@ def find_dataset_dtype(metadata):
 
 storage_dtype = find_dataset_dtype(dataset_config)
 
+
 if storage_dtype is None:
-    # Your current FineWeb binary format uses uint16.
-    #
-    # We do NOT silently assume GPT-2 or any tokenizer vocabulary.
-    # uint16 is only selected as the fallback because the existing
-    # dataset format stores these token IDs as uint16.
+
     storage_dtype = np.uint16
 
     print(
-        "Dataset dtype metadata not found; using uint16 for .bin files."
+        "Dataset dtype metadata not found; "
+        "using uint16 for .bin files."
     )
+
 
 storage_dtype = np.dtype(storage_dtype)
 
-
-# =============================================================================
-# Validate storage dtype
-# =============================================================================
 
 supported_storage_dtypes = {
     np.dtype(np.uint16),
@@ -407,26 +588,23 @@ supported_storage_dtypes = {
     np.dtype(np.int64),
 }
 
+
 require(
     storage_dtype in supported_storage_dtypes,
     (
         f"Unsupported dataset storage dtype: {storage_dtype}. "
-        "Supported types are uint16, uint32, int16, int32, and int64."
+        "Supported types are uint16, uint32, int16, int32, int64."
     )
 )
 
 
-if np.issubdtype(storage_dtype, np.signedinteger):
-    print(
-        f"Dataset storage dtype: {storage_dtype} "
-        "(signed integer; token IDs will be validated)"
-    )
-else:
-    print(f"Dataset storage dtype: {storage_dtype}")
+print(
+    f"Dataset storage dtype: {storage_dtype}"
+)
 
 
 # =============================================================================
-# Dataset length / memmap
+# Dataset memmaps
 # =============================================================================
 
 train_data = np.memmap(
@@ -460,60 +638,85 @@ require(
 
 
 # =============================================================================
-# Dataset token validation
+# Dataset validation
 # =============================================================================
 
 def validate_token_range(data, name):
-    """
-    Validate a sample of token IDs without scanning an arbitrarily huge file.
 
-    For normal datasets, the full range can optionally be checked through
-    dataset metadata. A small deterministic sample catches corrupt files
-    without turning startup into a giant dataset scan.
-    """
+    sample_size = min(
+        len(data),
+        1_000_000,
+    )
 
-    sample_size = min(len(data), 1_000_000)
 
     if sample_size == len(data):
+
         sample = data
+
     else:
-        # Deterministic evenly spaced sample.
+
         indices = np.linspace(
             0,
             len(data) - 1,
             num=sample_size,
             dtype=np.int64,
         )
+
         sample = data[indices]
 
-    if sample.size == 0:
-        fail(f"{name} is empty.")
 
-    if np.issubdtype(storage_dtype, np.signedinteger):
+    require(
+        sample.size > 0,
+        f"{name} is empty."
+    )
+
+
+    if np.issubdtype(
+        storage_dtype,
+        np.signedinteger,
+    ):
+
         min_token = int(sample.min())
-        if min_token < 0:
-            fail(
-                f"{name} contains a negative token ID: {min_token}."
+
+        require(
+            min_token >= 0,
+            (
+                f"{name} contains negative token ID "
+                f"{min_token}."
             )
+        )
+
 
     max_token = int(sample.max())
 
-    if max_token >= vocab_size:
-        fail(
+
+    require(
+        max_token < vocab_size,
+        (
             f"{name} contains token ID {max_token}, "
             f"but vocab_size={vocab_size}. "
             f"Valid IDs are 0..{vocab_size - 1}."
         )
+    )
+
 
     print(
-        f"{name}: {len(data):,} tokens | "
+        f"{name}: "
+        f"{len(data):,} tokens | "
         f"sample max ID={max_token:,} | "
         f"range OK"
     )
 
 
-validate_token_range(train_data, "train.bin")
-validate_token_range(val_data, "val.bin")
+validate_token_range(
+    train_data,
+    "train.bin",
+)
+
+validate_token_range(
+    val_data,
+    "val.bin",
+)
 
 
 # =============================================================================
@@ -529,8 +732,8 @@ print(f"train tokens    : {len(train_data):,}")
 print(f"val tokens      : {len(val_data):,}")
 print(f"vocab size      : {vocab_size:,}")
 print(f"block size      : {block_size:,}")
-print(f"streaming       : enabled")
-print(f"preload to GPU  : disabled")
+print("streaming       : enabled")
+print("preload to GPU  : disabled")
 print("=" * 70)
 
 
@@ -538,73 +741,108 @@ print("=" * 70)
 # Batch loader
 # =============================================================================
 
-# Reusable CPU tensors avoid repeatedly allocating the same tensor shapes.
 cpu_x = torch.empty(
-    (batch_size, block_size),
+    (
+        batch_size,
+        block_size,
+    ),
     dtype=torch.long,
 )
 
 cpu_y = torch.empty(
-    (batch_size, block_size),
+    (
+        batch_size,
+        block_size,
+    ),
     dtype=torch.long,
 )
 
 
+# Pin CPU buffers once.
+
+if using_cuda:
+
+    cpu_x = cpu_x.pin_memory()
+    cpu_y = cpu_y.pin_memory()
+
+
 def get_batch(split):
-    """
-    Random contiguous batches from a memory-mapped token stream.
 
-    No full dataset is loaded into RAM.
-    """
+    data = (
+        train_data
+        if split == "train"
+        else val_data
+    )
 
-    data = train_data if split == "train" else val_data
 
-    max_start = len(data) - block_size - 1
+    max_start = (
+        len(data)
+        - block_size
+        - 1
+    )
+
 
     starts = torch.randint(
         0,
         max_start + 1,
-        (batch_size,),
+        (
+            batch_size,
+        ),
         dtype=torch.int64,
     ).numpy()
 
-    # Fill reusable tensors.
-    #
-    # Each sample is contiguous in the original mmap.
+
     for row, start in enumerate(starts):
+
+        x_np = np.asarray(
+            data[
+                start:
+                start + block_size
+            ],
+            dtype=storage_dtype,
+        )
+
+        y_np = np.asarray(
+            data[
+                start + 1:
+                start + 1 + block_size
+            ],
+            dtype=storage_dtype,
+        )
+
+
         cpu_x[row].copy_(
             torch.from_numpy(
-                np.asarray(
-                    data[start:start + block_size],
-                    dtype=storage_dtype,
-                )
-            ).to(torch.long)
+                x_np
+            )
         )
+
 
         cpu_y[row].copy_(
             torch.from_numpy(
-                np.asarray(
-                    data[start + 1:start + 1 + block_size],
-                    dtype=storage_dtype,
-                )
-            ).to(torch.long)
+                y_np
+            )
         )
+
 
     if using_cuda:
-        # Pin once, then reuse.
-        x = cpu_x.pin_memory().to(
-            device,
-            non_blocking=True,
+
+        return (
+            cpu_x.to(
+                device,
+                non_blocking=True,
+            ),
+            cpu_y.to(
+                device,
+                non_blocking=True,
+            ),
         )
 
-        y = cpu_y.pin_memory().to(
-            device,
-            non_blocking=True,
-        )
 
-        return x, y
-
-    return cpu_x.to(device), cpu_y.to(device)
+    return (
+        cpu_x.to(device),
+        cpu_y.to(device),
+    )
 
 
 # =============================================================================
@@ -617,7 +855,6 @@ tokens_per_iter = (
     * gradient_accumulation_steps
 )
 
-effective_batch_tokens = tokens_per_iter
 
 print()
 print("=" * 70)
@@ -625,11 +862,11 @@ print("TRAINING")
 print("=" * 70)
 print(f"device                  : {device}")
 print(f"dtype                   : {ptdtype}")
-print(f"AMP                     : {use_grad_scaler or autocast_enabled if 'autocast_enabled' in globals() else False}")
+print(f"AMP                     : {autocast_enabled}")
 print(f"GradScaler              : {use_grad_scaler}")
 print(f"batch size              : {batch_size}")
 print(f"gradient accumulation   : {gradient_accumulation_steps}")
-print(f"effective tokens/step   : {effective_batch_tokens:,}")
+print(f"effective tokens/step   : {tokens_per_iter:,}")
 print(f"learning rate           : {learning_rate:g}")
 print(f"max iterations          : {max_iters:,}")
 print(f"compile                 : {compile}")
@@ -637,42 +874,363 @@ print("=" * 70)
 
 
 # =============================================================================
-# Model initialization
+# Generic model loading
+# =============================================================================
+
+require(
+    "model_module" in config,
+    (
+        "config.py must define model_module."
+    )
+)
+
+require(
+    "model_class" in config,
+    (
+        "config.py must define model_class."
+    )
+)
+
+require(
+    "model_kwargs" in config,
+    (
+        "config.py must define model_kwargs."
+    )
+)
+
+require(
+    isinstance(model_kwargs, dict),
+    "model_kwargs must be a dictionary."
+)
+
+
+def load_model_class():
+
+    module = importlib.import_module(
+        str(model_module)
+    )
+
+    require(
+        hasattr(module, str(model_class)),
+        (
+            f"Model class '{model_class}' "
+            f"was not found in module '{model_module}'."
+        )
+    )
+
+    return module, getattr(
+        module,
+        str(model_class),
+    )
+
+
+def build_model():
+
+    module, model_cls = load_model_class()
+
+
+    config_class_name = config.get(
+        "model_config_class",
+        None,
+    )
+
+
+    # -------------------------------------------------------------------------
+    # Model directly accepts kwargs
+    # -------------------------------------------------------------------------
+
+    if config_class_name is None:
+
+        try:
+
+            return model_cls(
+                **model_kwargs
+            )
+
+        except TypeError as e:
+
+            fail(
+                "Could not construct the configured model.\n"
+                f"model class : {model_class}\n"
+                f"kwargs      : {model_kwargs}\n"
+                f"error       : {e}"
+            )
+
+
+    # -------------------------------------------------------------------------
+    # Model expects a configuration object
+    # -------------------------------------------------------------------------
+
+    require(
+        hasattr(module, str(config_class_name)),
+        (
+            f"Model config class '{config_class_name}' "
+            f"was not found in module '{model_module}'."
+        )
+    )
+
+
+    config_cls = getattr(
+        module,
+        str(config_class_name),
+    )
+
+
+    try:
+
+        model_config = config_cls(
+            **model_kwargs
+        )
+
+    except TypeError as e:
+
+        fail(
+            "Could not construct model configuration.\n"
+            f"config class : {config_class_name}\n"
+            f"kwargs       : {model_kwargs}\n"
+            f"error        : {e}"
+        )
+
+
+    try:
+
+        return model_cls(
+            model_config
+        )
+
+    except TypeError as e:
+
+        fail(
+            "Could not construct the model from its configuration.\n"
+            f"model class  : {model_class}\n"
+            f"config class : {config_class_name}\n"
+            f"error        : {e}"
+        )
+
+
+# =============================================================================
+# Generic model output handling
+# =============================================================================
+
+def unpack_model_output(output):
+
+    """
+    Convert different reasonable model return formats into:
+
+        logits, loss
+
+    Preferred contract:
+
+        (logits, loss)
+
+    Supported alternatives:
+
+        logits
+        {"logits": ..., "loss": ...}
+        object.logits / object.loss
+    """
+
+    logits = None
+    loss = None
+
+
+    if isinstance(output, tuple):
+
+        require(
+            len(output) >= 1,
+            "Model returned an empty tuple."
+        )
+
+        logits = output[0]
+
+        if len(output) >= 2:
+            loss = output[1]
+
+
+    elif isinstance(output, dict):
+
+        logits = output.get("logits")
+        loss = output.get("loss")
+
+
+    else:
+
+        if hasattr(output, "logits"):
+            logits = output.logits
+
+        else:
+            logits = output
+
+
+        if hasattr(output, "loss"):
+            loss = output.loss
+
+
+    require(
+        logits is not None,
+        (
+            "Model forward pass did not return logits."
+        )
+    )
+
+
+    return logits, loss
+
+
+def calculate_loss(logits, targets):
+
+    """
+    Generic next-token cross entropy.
+
+    This is only used when the model does not provide its own loss.
+    """
+
+    require(
+        torch.is_tensor(logits),
+        "Model logits must be a torch.Tensor."
+    )
+
+
+    require(
+        logits.ndim == 3,
+        (
+            "Generic loss calculation expects logits "
+            "with shape [B, T, V]. "
+            f"Received shape: {tuple(logits.shape)}"
+        )
+    )
+
+
+    require(
+        targets.ndim == 2,
+        (
+            "Targets must have shape [B, T]. "
+            f"Received shape: {tuple(targets.shape)}"
+        )
+    )
+
+
+    require(
+        logits.shape[0] == targets.shape[0]
+        and logits.shape[1] == targets.shape[1],
+        (
+            "Logits and targets have incompatible "
+            f"sequence shapes: "
+            f"logits={tuple(logits.shape)}, "
+            f"targets={tuple(targets.shape)}"
+        )
+    )
+
+
+    return torch.nn.functional.cross_entropy(
+        logits.reshape(
+            -1,
+            logits.shape[-1],
+        ),
+        targets.reshape(-1),
+    )
+
+
+def forward_model(X, Y):
+
+    """
+    Universal model forward.
+
+    Preferred:
+
+        model(X, Y)
+
+    Fallback:
+
+        model(X)
+
+    If the model does not provide a loss, the trainer computes
+    standard next-token cross entropy from the returned logits.
+    """
+
+    try:
+
+        output = model(
+            X,
+            Y,
+        )
+
+    except TypeError:
+
+        output = model(
+            X
+        )
+
+
+    logits, loss = unpack_model_output(
+        output
+    )
+
+
+    if loss is None:
+
+        loss = calculate_loss(
+            logits,
+            Y,
+        )
+
+
+    require(
+        torch.is_tensor(loss),
+        "Model loss must be a torch.Tensor."
+    )
+
+
+    require(
+        loss.ndim == 0,
+        (
+            "Model loss must be scalar. "
+            f"Received shape: {tuple(loss.shape)}"
+        )
+    )
+
+
+    return logits, loss
+
+
+# =============================================================================
+# Build model
 # =============================================================================
 
 iter_num = 0
 best_val_loss = float("inf")
 
-model_args = dict(
-    n_layer=n_layer,
-    n_head=n_head,
-    n_embd=n_embd,
-    block_size=block_size,
-    bias=bias,
-    vocab_size=vocab_size,
-    dropout=dropout,
-)
-
-
 checkpoint = None
+
 
 if init_from == "scratch":
 
     print("\nInitializing model from scratch.")
 
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = build_model()
+
 
 elif init_from == "resume":
 
-    ckpt_path = os.path.join(out_dir, "ckpt.pt")
+    ckpt_path = os.path.join(
+        out_dir,
+        "ckpt.pt",
+    )
+
 
     require(
         os.path.isfile(ckpt_path),
-        f"Cannot resume: checkpoint does not exist:\n{ckpt_path}"
+        (
+            "Cannot resume: checkpoint does not exist:\n"
+            f"{ckpt_path}"
+        )
     )
 
-    print(f"\nResuming from: {ckpt_path}")
+
+    print(
+        f"\nResuming from: {ckpt_path}"
+    )
+
 
     checkpoint = torch.load(
         ckpt_path,
@@ -680,60 +1238,68 @@ elif init_from == "resume":
         weights_only=False,
     )
 
+
     require(
-        "model_args" in checkpoint,
-        "Checkpoint does not contain model_args."
+        "model" in checkpoint,
+        "Checkpoint does not contain model state."
     )
 
-    checkpoint_model_args = checkpoint["model_args"]
 
-    # These define the model architecture.
-    architecture_keys = [
-        "n_layer",
-        "n_head",
-        "n_embd",
-        "block_size",
-        "bias",
-        "vocab_size",
-    ]
+    model = build_model()
 
-    for key in architecture_keys:
-        checkpoint_value = checkpoint_model_args[key]
-        current_value = model_args[key]
-
-        if checkpoint_value != current_value:
-            fail(
-                f"Checkpoint/model mismatch for '{key}':\n"
-                f"  checkpoint: {checkpoint_value}\n"
-                f"  config:     {current_value}\n"
-                "\n"
-                "Change config.py to match the checkpoint "
-                "or start with init_from='scratch'."
-            )
-
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
 
     state_dict = checkpoint["model"]
 
-    # torch.compile can add this prefix to state dict keys.
+
+    # Remove torch.compile prefix if present.
+
     compiled_prefix = "_orig_mod."
 
-    if any(k.startswith(compiled_prefix) for k in state_dict):
+
+    if any(
+        key.startswith(compiled_prefix)
+        for key in state_dict
+    ):
+
         state_dict = {
             (
-                k[len(compiled_prefix):]
-                if k.startswith(compiled_prefix)
-                else k
-            ): v
-            for k, v in state_dict.items()
+                key[len(compiled_prefix):]
+                if key.startswith(compiled_prefix)
+                else key
+            ):
+            value
+
+            for key, value in state_dict.items()
         }
 
-    model.load_state_dict(state_dict)
 
-    iter_num = int(checkpoint.get("iter_num", 0))
+    try:
+
+        model.load_state_dict(
+            state_dict
+        )
+
+    except RuntimeError as e:
+
+        fail(
+            "Checkpoint/model state_dict mismatch.\n"
+            f"{e}"
+        )
+
+
+    iter_num = int(
+        checkpoint.get(
+            "iter_num",
+            0,
+        )
+    )
+
+
     best_val_loss = float(
-        checkpoint.get("best_val_loss", float("inf"))
+        checkpoint.get(
+            "best_val_loss",
+            float("inf"),
+        )
     )
 
 
@@ -742,31 +1308,12 @@ elif init_from == "resume":
 # =============================================================================
 
 require(
-    model.config.vocab_size == vocab_size,
+    isinstance(model, torch.nn.Module),
     (
-        f"Model vocab_size={model.config.vocab_size} does not match "
-        f"config vocab_size={vocab_size}."
+        "Configured model must be an instance of "
+        "torch.nn.Module."
     )
 )
-
-require(
-    model.config.block_size >= block_size,
-    (
-        f"Model block_size={model.config.block_size} is smaller than "
-        f"configured block_size={block_size}."
-    )
-)
-
-
-if block_size < model.config.block_size:
-    if hasattr(model, "crop_block_size"):
-        model.crop_block_size(block_size)
-        model_args["block_size"] = block_size
-    else:
-        fail(
-            "Configured block_size is smaller than the model's block_size, "
-            "but model.crop_block_size() is unavailable."
-        )
 
 
 # =============================================================================
@@ -776,14 +1323,15 @@ if block_size < model.config.block_size:
 model.to(device)
 
 
-# ===============
+# =============================================================================
 # Parameter count
 # =============================================================================
 
 num_params = sum(
-    p.numel()
-    for p in model.parameters()
+    parameter.numel()
+    for parameter in model.parameters()
 )
+
 
 print(
     f"number of parameters: "
@@ -796,22 +1344,82 @@ print(
 # Optimizer
 # =============================================================================
 
-optimizer = model.configure_optimizers(
-    weight_decay,
-    learning_rate,
-    (beta1, beta2),
-    device_type,
-)
+def build_optimizer():
 
-if checkpoint is not None and "optimizer" in checkpoint:
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    # If the model provides its own optimizer factory,
+    # use it without knowing anything about the architecture.
 
-    # Optimizer states were loaded onto CPU by map_location.
-    # Move tensor states to the training device.
+    configure = getattr(
+        model,
+        "configure_optimizers",
+        None,
+    )
+
+
+    if callable(configure):
+
+        try:
+
+            return configure(
+                weight_decay,
+                learning_rate,
+                (beta1, beta2),
+                device_type,
+            )
+
+        except TypeError:
+
+            # Some models may expose a simpler signature.
+            try:
+
+                return configure(
+                    learning_rate=learning_rate,
+                    weight_decay=weight_decay,
+                    betas=(beta1, beta2),
+                )
+
+            except TypeError as e:
+
+                fail(
+                    "Model.configure_optimizers() exists "
+                    "but could not be called with the supported "
+                    "generic signatures.\n"
+                    f"error: {e}"
+                )
+
+
+    # Generic fallback.
+
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        betas=(beta1, beta2),
+        weight_decay=weight_decay,
+    )
+
+
+optimizer = build_optimizer()
+
+
+if (
+    checkpoint is not None
+    and "optimizer" in checkpoint
+):
+
+    optimizer.load_state_dict(
+        checkpoint["optimizer"]
+    )
+
+
     for state in optimizer.state.values():
+
         for key, value in state.items():
+
             if torch.is_tensor(value):
-                state[key] = value.to(device)
+
+                state[key] = value.to(
+                    device
+                )
 
 
 checkpoint = None
@@ -823,20 +1431,46 @@ checkpoint = None
 
 if compile:
 
-    if not hasattr(torch, "compile"):
-        fail(
+    require(
+        hasattr(torch, "compile"),
+        (
             "compile=True but this PyTorch installation "
             "does not provide torch.compile."
         )
+    )
+
 
     print(
         f"compiling model with mode='{compile_mode}'..."
     )
 
+
     model = torch.compile(
         model,
         mode=compile_mode,
     )
+
+
+# =============================================================================
+# Raw model helper
+# =============================================================================
+
+def get_raw_model():
+
+    model_to_save = model
+
+
+    if hasattr(
+        model_to_save,
+        "_orig_mod",
+    ):
+
+        model_to_save = (
+            model_to_save._orig_mod
+        )
+
+
+    return model_to_save
 
 
 # =============================================================================
@@ -848,27 +1482,53 @@ def estimate_loss():
 
     model.eval()
 
+
     results = {}
 
-    for split in ("train", "val"):
+
+    for split in (
+        "train",
+        "val",
+    ):
 
         losses = torch.empty(
             eval_iters,
             dtype=torch.float32,
         )
 
-        for k in range(eval_iters):
 
-            X, Y = get_batch(split)
+        for k in range(
+            eval_iters
+        ):
+
+            X, Y = get_batch(
+                split
+            )
+
 
             with autocast_context:
-                _, loss = model(X, Y)
 
-            losses[k] = loss.detach().float().cpu()
+                _, loss = forward_model(
+                    X,
+                    Y,
+                )
 
-        results[split] = losses.mean().item()
+
+            losses[k] = (
+                loss
+                .detach()
+                .float()
+                .cpu()
+            )
+
+
+        results[split] = (
+            losses.mean().item()
+        )
+
 
     model.train()
+
 
     return results
 
@@ -882,27 +1542,43 @@ def get_lr(iteration):
     if not decay_lr:
         return learning_rate
 
+
     if iteration < warmup_iters:
+
         return (
             learning_rate
             * (iteration + 1)
             / (warmup_iters + 1)
         )
 
+
     if iteration >= lr_decay_iters:
+
         return min_lr
+
 
     decay_ratio = (
         (iteration - warmup_iters)
         / (lr_decay_iters - warmup_iters)
     )
 
+
     coeff = 0.5 * (
-        1.0 + math.cos(math.pi * decay_ratio)
+        1.0
+        + math.cos(
+            math.pi
+            * decay_ratio
+        )
     )
 
-    return min_lr + coeff * (
-        learning_rate - min_lr
+
+    return (
+        min_lr
+        + coeff
+        * (
+            learning_rate
+            - min_lr
+        )
     )
 
 
@@ -913,11 +1589,15 @@ def get_lr(iteration):
 if wandb_log:
 
     try:
+
         import wandb
+
     except ImportError:
+
         fail(
             "wandb_log=True but wandb is not installed."
         )
+
 
     wandb.init(
         project=wandb_project,
@@ -927,40 +1607,42 @@ if wandb_log:
 
 
 # =============================================================================
-# Checkpoint helper
+# Checkpoint
 # =============================================================================
-
-def get_raw_model():
-    """
-    torch.compile wraps the model, so unwrap it when possible.
-    """
-    model_to_save = model
-
-    if hasattr(model_to_save, "_orig_mod"):
-        model_to_save = model_to_save._orig_mod
-
-    return model_to_save
-
 
 def save_checkpoint(val_loss):
 
     raw_model = get_raw_model()
 
+
     checkpoint = {
         "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "model_args": model_args,
+        "model_config": {
+            "module": model_module,
+            "class": model_class,
+            "config_class": config.get(
+                "model_config_class",
+                None,
+            ),
+            "kwargs": model_kwargs,
+        },
         "iter_num": iter_num,
         "best_val_loss": best_val_loss,
         "config": config,
     }
+
 
     path = os.path.join(
         out_dir,
         "ckpt.pt",
     )
 
-    print(f"saving checkpoint to {path}")
+
+    print(
+        f"saving checkpoint to {path}"
+    )
+
 
     torch.save(
         checkpoint,
@@ -969,17 +1651,22 @@ def save_checkpoint(val_loss):
 
 
 # =============================================================================
-# Create output directory
+# Output directory
 # =============================================================================
 
-os.makedirs(out_dir, exist_ok=True)
+os.makedirs(
+    out_dir,
+    exist_ok=True,
+)
 
 
 # =============================================================================
 # Initial batch
 # =============================================================================
 
-X, Y = get_batch("train")
+X, Y = get_batch(
+    "train"
+)
 
 
 # =============================================================================
@@ -989,7 +1676,7 @@ X, Y = get_batch("train")
 t0 = time.time()
 
 local_iter_num = 0
-running_mfu = -1.0
+
 
 while True:
 
@@ -997,22 +1684,28 @@ while True:
     # Learning rate
     # -------------------------------------------------------------------------
 
-    lr = get_lr(iter_num)
+    lr = get_lr(
+        iter_num
+    )
+
 
     for param_group in optimizer.param_groups:
+
         param_group["lr"] = lr
 
 
     # -------------------------------------------------------------------------
-    # Evaluation / checkpointing
+    # Evaluation
     # -------------------------------------------------------------------------
 
     if iter_num % eval_interval == 0:
 
         losses = estimate_loss()
 
+
         train_loss = losses["train"]
         val_loss = losses["val"]
+
 
         print(
             f"step {iter_num}: "
@@ -1020,35 +1713,46 @@ while True:
             f"val loss {val_loss:.4f}"
         )
 
+
         if wandb_log:
+
             wandb.log({
                 "iter": iter_num,
                 "train/loss": train_loss,
                 "val/loss": val_loss,
                 "lr": lr,
-                "mfu": (
-                    running_mfu * 100
-                    if running_mfu >= 0
-                    else 0.0
-                ),
             })
 
-        improved = val_loss < best_val_loss
+
+        improved = (
+            val_loss
+            < best_val_loss
+        )
+
 
         if improved:
+
             best_val_loss = val_loss
+
 
         if always_save_checkpoint or improved:
 
             if iter_num > 0:
-                save_checkpoint(val_loss)
+
+                save_checkpoint(
+                    val_loss
+                )
 
 
     # -------------------------------------------------------------------------
     # Evaluation-only mode
     # -------------------------------------------------------------------------
 
-    if iter_num == 0 and eval_only:
+    if (
+        iter_num == 0
+        and eval_only
+    ):
+
         break
 
 
@@ -1056,9 +1760,13 @@ while True:
     # Gradient accumulation
     # -------------------------------------------------------------------------
 
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad(
+        set_to_none=True
+    )
+
 
     last_loss = None
+
 
     for micro_step in range(
         gradient_accumulation_steps
@@ -1066,24 +1774,36 @@ while True:
 
         with autocast_context:
 
-            logits, loss = model(X, Y)
+            _, loss = forward_model(
+                X,
+                Y,
+            )
+
 
             loss_for_backward = (
                 loss
                 / gradient_accumulation_steps
             )
 
+
         last_loss = loss.detach()
 
-        # Fetch next batch while the current forward/backward
-        # computation is progressing.
-        X, Y = get_batch("train")
+
+        # Fetch next batch.
+
+        X, Y = get_batch(
+            "train"
+        )
+
 
         if use_grad_scaler:
+
             scaler.scale(
                 loss_for_backward
             ).backward()
+
         else:
+
             loss_for_backward.backward()
 
 
@@ -1094,7 +1814,11 @@ while True:
     if grad_clip > 0:
 
         if use_grad_scaler:
-            scaler.unscale_(optimizer)
+
+            scaler.unscale_(
+                optimizer
+            )
+
 
         torch.nn.utils.clip_grad_norm_(
             model.parameters(),
@@ -1108,7 +1832,10 @@ while True:
 
     if use_grad_scaler:
 
-        scaler.step(optimizer)
+        scaler.step(
+            optimizer
+        )
+
         scaler.update()
 
     else:
@@ -1117,65 +1844,41 @@ while True:
 
 
     # -------------------------------------------------------------------------
-    # Timing / logging
+    # Timing
     # -------------------------------------------------------------------------
 
     t1 = time.time()
 
+
     dt = t1 - t0
+
     t0 = t1
+
 
     if iter_num % log_interval == 0:
 
         loss_value = (
-            last_loss.float().item()
+            last_loss
+            .float()
+            .item()
         )
 
-        tokens_this_step = tokens_per_iter
 
         tok_per_sec = (
-            tokens_this_step / dt
+            tokens_per_iter / dt
             if dt > 0
             else 0.0
         )
 
-        mfu_text = "N/A"
-
-        if local_iter_num >= 5 and hasattr(
-            get_raw_model(),
-            "estimate_mfu",
-        ):
-
-            try:
-
-                mfu = get_raw_model().estimate_mfu(
-                    batch_size
-                    * gradient_accumulation_steps,
-                    dt,
-                )
-
-                running_mfu = (
-                    mfu
-                    if running_mfu < 0
-                    else 0.9 * running_mfu
-                    + 0.1 * mfu
-                )
-
-                mfu_text = (
-                    f"{running_mfu * 100:.2f}%"
-                )
-
-            except Exception:
-                mfu_text = "N/A"
 
         print(
             f"iter {iter_num}: "
             f"loss {loss_value:.4f}, "
             f"lr {lr:.6g}, "
             f"time {dt * 1000:.2f}ms, "
-            f"tok/s {tok_per_sec:,.0f}, "
-            f"mfu {mfu_text}"
+            f"tok/s {tok_per_sec:,.0f}"
         )
+
 
     iter_num += 1
     local_iter_num += 1
@@ -1186,6 +1889,7 @@ while True:
     # -------------------------------------------------------------------------
 
     if iter_num >= max_iters:
+
         break
 
 
@@ -1193,7 +1897,11 @@ while True:
 # Final checkpoint
 # =============================================================================
 
-print("\nTraining finished.")
+print(
+    "\nTraining finished."
+)
+
 
 if wandb_log:
+
     wandb.finish()
