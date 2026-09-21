@@ -22,7 +22,7 @@ preload_data_to_gpu = False
 
 # ---------------------------- model ----------------------------
 vocab_size = 8192
-n_layer = 8
+n_layer = 16
 n_head = 8
 n_embd = 256
 block_size = 256
@@ -30,7 +30,7 @@ dropout = 0.0
 bias = False
 
 # ---------------------------- batching -------------------------
-batch_size = 256
+batch_size = 128
 gradient_accumulation_steps = 16
 
 # --------------------------- optimizer -------------------------
