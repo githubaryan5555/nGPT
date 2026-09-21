@@ -777,3 +777,423 @@ model.to(device)
 
 
 # ===============
+# Parameter count
+# =============================================================================
+
+num_params = sum(
+    p.numel()
+    for p in model.parameters()
+)
+
+print(
+    f"number of parameters: "
+    f"{num_params:,} "
+    f"({num_params / 1e6:.2f}M)"
+)
+
+
+# =============================================================================
+# Optimizer
+# =============================================================================
+
+optimizer = model.configure_optimizers(
+    weight_decay,
+    learning_rate,
+    (beta1, beta2),
+    device_type,
+)
+
+if checkpoint is not None and "optimizer" in checkpoint:
+    optimizer.load_state_dict(checkpoint["optimizer"])
+
+    # Optimizer states were loaded onto CPU by map_location.
+    # Move tensor states to the training device.
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+checkpoint = None
+
+
+# =============================================================================
+# torch.compile
+# =============================================================================
+
+if compile:
+
+    if not hasattr(torch, "compile"):
+        fail(
+            "compile=True but this PyTorch installation "
+            "does not provide torch.compile."
+        )
+
+    print(
+        f"compiling model with mode='{compile_mode}'..."
+    )
+
+    model = torch.compile(
+        model,
+        mode=compile_mode,
+    )
+
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+
+@torch.no_grad()
+def estimate_loss():
+
+    model.eval()
+
+    results = {}
+
+    for split in ("train", "val"):
+
+        losses = torch.empty(
+            eval_iters,
+            dtype=torch.float32,
+        )
+
+        for k in range(eval_iters):
+
+            X, Y = get_batch(split)
+
+            with autocast_context:
+                _, loss = model(X, Y)
+
+            losses[k] = loss.detach().float().cpu()
+
+        results[split] = losses.mean().item()
+
+    model.train()
+
+    return results
+
+
+# =============================================================================
+# Learning-rate scheduler
+# =============================================================================
+
+def get_lr(iteration):
+
+    if not decay_lr:
+        return learning_rate
+
+    if iteration < warmup_iters:
+        return (
+            learning_rate
+            * (iteration + 1)
+            / (warmup_iters + 1)
+        )
+
+    if iteration >= lr_decay_iters:
+        return min_lr
+
+    decay_ratio = (
+        (iteration - warmup_iters)
+        / (lr_decay_iters - warmup_iters)
+    )
+
+    coeff = 0.5 * (
+        1.0 + math.cos(math.pi * decay_ratio)
+    )
+
+    return min_lr + coeff * (
+        learning_rate - min_lr
+    )
+
+
+# =============================================================================
+# W&B
+# =============================================================================
+
+if wandb_log:
+
+    try:
+        import wandb
+    except ImportError:
+        fail(
+            "wandb_log=True but wandb is not installed."
+        )
+
+    wandb.init(
+        project=wandb_project,
+        name=wandb_run_name,
+        config=config,
+    )
+
+
+# =============================================================================
+# Checkpoint helper
+# =============================================================================
+
+def get_raw_model():
+    """
+    torch.compile wraps the model, so unwrap it when possible.
+    """
+    model_to_save = model
+
+    if hasattr(model_to_save, "_orig_mod"):
+        model_to_save = model_to_save._orig_mod
+
+    return model_to_save
+
+
+def save_checkpoint(val_loss):
+
+    raw_model = get_raw_model()
+
+    checkpoint = {
+        "model": raw_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "model_args": model_args,
+        "iter_num": iter_num,
+        "best_val_loss": best_val_loss,
+        "config": config,
+    }
+
+    path = os.path.join(
+        out_dir,
+        "ckpt.pt",
+    )
+
+    print(f"saving checkpoint to {path}")
+
+    torch.save(
+        checkpoint,
+        path,
+    )
+
+
+# =============================================================================
+# Create output directory
+# =============================================================================
+
+os.makedirs(out_dir, exist_ok=True)
+
+
+# =============================================================================
+# Initial batch
+# =============================================================================
+
+X, Y = get_batch("train")
+
+
+# =============================================================================
+# Training loop
+# =============================================================================
+
+t0 = time.time()
+
+local_iter_num = 0
+running_mfu = -1.0
+
+while True:
+
+    # -------------------------------------------------------------------------
+    # Learning rate
+    # -------------------------------------------------------------------------
+
+    lr = get_lr(iter_num)
+
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+
+    # -------------------------------------------------------------------------
+    # Evaluation / checkpointing
+    # -------------------------------------------------------------------------
+
+    if iter_num % eval_interval == 0:
+
+        losses = estimate_loss()
+
+        train_loss = losses["train"]
+        val_loss = losses["val"]
+
+        print(
+            f"step {iter_num}: "
+            f"train loss {train_loss:.4f}, "
+            f"val loss {val_loss:.4f}"
+        )
+
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "train/loss": train_loss,
+                "val/loss": val_loss,
+                "lr": lr,
+                "mfu": (
+                    running_mfu * 100
+                    if running_mfu >= 0
+                    else 0.0
+                ),
+            })
+
+        improved = val_loss < best_val_loss
+
+        if improved:
+            best_val_loss = val_loss
+
+        if always_save_checkpoint or improved:
+
+            if iter_num > 0:
+                save_checkpoint(val_loss)
+
+
+    # -------------------------------------------------------------------------
+    # Evaluation-only mode
+    # -------------------------------------------------------------------------
+
+    if iter_num == 0 and eval_only:
+        break
+
+
+    # -------------------------------------------------------------------------
+    # Gradient accumulation
+    # -------------------------------------------------------------------------
+
+    optimizer.zero_grad(set_to_none=True)
+
+    last_loss = None
+
+    for micro_step in range(
+        gradient_accumulation_steps
+    ):
+
+        with autocast_context:
+
+            logits, loss = model(X, Y)
+
+            loss_for_backward = (
+                loss
+                / gradient_accumulation_steps
+            )
+
+        last_loss = loss.detach()
+
+        # Fetch next batch while the current forward/backward
+        # computation is progressing.
+        X, Y = get_batch("train")
+
+        if use_grad_scaler:
+            scaler.scale(
+                loss_for_backward
+            ).backward()
+        else:
+            loss_for_backward.backward()
+
+
+    # -------------------------------------------------------------------------
+    # Gradient clipping
+    # -------------------------------------------------------------------------
+
+    if grad_clip > 0:
+
+        if use_grad_scaler:
+            scaler.unscale_(optimizer)
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            grad_clip,
+        )
+
+
+    # -------------------------------------------------------------------------
+    # Optimizer update
+    # -------------------------------------------------------------------------
+
+    if use_grad_scaler:
+
+        scaler.step(optimizer)
+        scaler.update()
+
+    else:
+
+        optimizer.step()
+
+
+    # -------------------------------------------------------------------------
+    # Timing / logging
+    # -------------------------------------------------------------------------
+
+    t1 = time.time()
+
+    dt = t1 - t0
+    t0 = t1
+
+    if iter_num % log_interval == 0:
+
+        loss_value = (
+            last_loss.float().item()
+        )
+
+        tokens_this_step = tokens_per_iter
+
+        tok_per_sec = (
+            tokens_this_step / dt
+            if dt > 0
+            else 0.0
+        )
+
+        mfu_text = "N/A"
+
+        if local_iter_num >= 5 and hasattr(
+            get_raw_model(),
+            "estimate_mfu",
+        ):
+
+            try:
+
+                mfu = get_raw_model().estimate_mfu(
+                    batch_size
+                    * gradient_accumulation_steps,
+                    dt,
+                )
+
+                running_mfu = (
+                    mfu
+                    if running_mfu < 0
+                    else 0.9 * running_mfu
+                    + 0.1 * mfu
+                )
+
+                mfu_text = (
+                    f"{running_mfu * 100:.2f}%"
+                )
+
+            except Exception:
+                mfu_text = "N/A"
+
+        print(
+            f"iter {iter_num}: "
+            f"loss {loss_value:.4f}, "
+            f"lr {lr:.6g}, "
+            f"time {dt * 1000:.2f}ms, "
+            f"tok/s {tok_per_sec:,.0f}, "
+            f"mfu {mfu_text}"
+        )
+
+    iter_num += 1
+    local_iter_num += 1
+
+
+    # -------------------------------------------------------------------------
+    # Termination
+    # -------------------------------------------------------------------------
+
+    if iter_num >= max_iters:
+        break
+
+
+# =============================================================================
+# Final checkpoint
+# =============================================================================
+
+print("\nTraining finished.")
+
+if wandb_log:
+    wandb.finish()
