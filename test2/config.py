@@ -30,7 +30,7 @@ dropout = 0.0
 bias = False
 
 # ---------------------------- batching -------------------------
-batch_size = 128
+batch_size = 64
 gradient_accumulation_steps = 16
 
 # --------------------------- optimizer -------------------------
