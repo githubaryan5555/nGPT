@@ -5,14 +5,14 @@
 # Vocabulary / Model
 vocab_size = 8192
 hidden_size = 256
-num_hidden_layers = 6
+num_hidden_layers = 8
 
 # MLP / SwiGLU
-intermediate_size = 768
+intermediate_size = 1024
 
 # Attention / GQA
 num_attention_heads = 8
-num_key_value_heads = 2
+num_key_value_heads = 4
 attention_dropout = 0.0
 
 # Model dropout
