@@ -1,4 +1,5 @@
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +9,8 @@ import torch.nn.functional as F
 # CENTRALIZED MODEL CONFIG
 # ============================================================
 
+# Vocabulary / Model
+vocab_size = 8192
 hidden_size = 256
 num_hidden_layers = 6
 
@@ -19,12 +22,21 @@ num_attention_heads = 8
 num_key_value_heads = 2
 attention_dropout = 0.0
 
+# Model dropout
+hidden_dropout = 0.0
+
 # RMSNorm
 rms_norm_eps = 1e-5
 
 # RoPE
 rope_theta = 10000.0
 max_seq_len = 256
+
+# Output
+tie_word_embeddings = True
+
+# Initialization
+initializer_range = 0.02
 
 
 # ============================================================
@@ -39,18 +51,31 @@ num_queries_per_kv = num_attention_heads // num_key_value_heads
 # SANITY CHECKS
 # ============================================================
 
+assert vocab_size > 0
+assert hidden_size > 0
+assert num_hidden_layers > 0
+
 assert hidden_size % num_attention_heads == 0
 assert num_attention_heads % num_key_value_heads == 0
 assert head_dim % 2 == 0
 
 assert intermediate_size > hidden_size
+
 assert max_seq_len > 0
 
 assert rms_norm_eps > 0
+
 assert attention_dropout >= 0.0
 assert attention_dropout < 1.0
 
+assert hidden_dropout >= 0.0
+assert hidden_dropout < 1.0
+
 assert rope_theta > 0
+
+assert initializer_range > 0
+
+assert isinstance(tie_word_embeddings, bool)
 
 
 # ============================================================
@@ -119,24 +144,21 @@ class RoPE(nn.Module):
 
         seq_len = x.shape[1]
 
-        # [sequence, head_dim / 2]
+        assert seq_len <= self.cos.shape[0], (
+            f"Sequence length {seq_len} exceeds "
+            f"max_seq_len {self.cos.shape[0]}"
+        )
+
         cos = self.cos[:seq_len]
         sin = self.sin[:seq_len]
 
-        # Convert:
-        #
-        # [sequence, head_dim / 2]
-        #
-        # into:
-        #
-        # [1, sequence, 1, head_dim / 2]
-        #
-        # so it broadcasts across batch and heads.
+        # [S, D/2]
+        # ->
+        # [1, S, 1, D/2]
 
         cos = cos.unsqueeze(0).unsqueeze(2)
         sin = sin.unsqueeze(0).unsqueeze(2)
 
-        # Keep RoPE in the same dtype as the input.
         cos = cos.to(dtype=x.dtype)
         sin = sin.to(dtype=x.dtype)
 
@@ -249,7 +271,9 @@ class GQAAttention(nn.Module):
 
         # [B, S, KV, 1, D]
         #
-        # -> [B, S, KV, queries_per_KV, D]
+        # ->
+        #
+        # [B, S, KV, queries_per_KV, D]
 
         x = x.expand(
             batch,
@@ -258,12 +282,6 @@ class GQAAttention(nn.Module):
             self.num_queries_per_kv,
             dim,
         )
-
-        # Merge KV heads and repetition:
-        #
-        # [B, S, KV, queries_per_KV, D]
-        #
-        # -> [B, S, attention_heads, D]
 
         return x.reshape(
             batch,
@@ -309,7 +327,7 @@ class GQAAttention(nn.Module):
         )
 
         # ----------------------------------------------------
-        # Apply RoPE to Q and K
+        # Apply RoPE
         # ----------------------------------------------------
 
         q = self.rope(q)
@@ -323,12 +341,8 @@ class GQAAttention(nn.Module):
         v = self.repeat_kv(v)
 
         # ----------------------------------------------------
-        # Rearrange:
-        #
         # [B, S, H, D]
-        #
         # ->
-        #
         # [B, H, S, D]
         # ----------------------------------------------------
 
@@ -353,8 +367,8 @@ class GQAAttention(nn.Module):
         )
 
         # ----------------------------------------------------
-        # Back to:
-        #
+        # [B, H, S, D]
+        # ->
         # [B, S, H, D]
         # ----------------------------------------------------
 
@@ -473,3 +487,210 @@ class Block(nn.Module):
         )
 
         return x
+
+
+# ============================================================
+# MODEL 5555
+# ============================================================
+
+class Model5555(nn.Module):
+    def __init__(
+        self,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        num_hidden_layers=num_hidden_layers,
+        hidden_dropout=hidden_dropout,
+        tie_word_embeddings=tie_word_embeddings,
+    ):
+        super().__init__()
+
+        # ----------------------------------------------------
+        # Store model configuration
+        # ----------------------------------------------------
+
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.max_seq_len = max_seq_len
+
+        self.tie_word_embeddings = tie_word_embeddings
+
+        # ----------------------------------------------------
+        # Token embedding
+        #
+        # [B, S]
+        # ->
+        # [B, S, hidden_size]
+        # ----------------------------------------------------
+
+        self.embed_tokens = nn.Embedding(
+            vocab_size,
+            hidden_size,
+        )
+
+        # ----------------------------------------------------
+        # Input dropout
+        # ----------------------------------------------------
+
+        self.embed_dropout = nn.Dropout(
+            hidden_dropout
+        )
+
+        # ----------------------------------------------------
+        # Transformer blocks
+        # ----------------------------------------------------
+
+        self.layers = nn.ModuleList(
+            [
+                Block()
+                for _ in range(num_hidden_layers)
+            ]
+        )
+
+        # ----------------------------------------------------
+        # Final RMSNorm
+        # ----------------------------------------------------
+
+        self.final_layernorm = RMSNorm(
+            hidden_size,
+            rms_norm_eps,
+        )
+
+        # ----------------------------------------------------
+        # Language-model head
+        #
+        # [B, S, hidden_size]
+        # ->
+        # [B, S, vocab_size]
+        # ----------------------------------------------------
+
+        self.lm_head = nn.Linear(
+            hidden_size,
+            vocab_size,
+            bias=False,
+        )
+
+        # ----------------------------------------------------
+        # Weight tying
+        # ----------------------------------------------------
+
+        if tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+
+        # ----------------------------------------------------
+        # Initialize weights
+        # ----------------------------------------------------
+
+        self.apply(self._init_weights)
+
+        # Re-tie after initialization for clarity.
+        if tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+
+    # ========================================================
+    # WEIGHT INITIALIZATION
+    # ========================================================
+
+    def _init_weights(self, module):
+
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(
+                module.weight,
+                mean=0.0,
+                std=initializer_range,
+            )
+
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(
+                module.weight,
+                mean=0.0,
+                std=initializer_range,
+            )
+
+        elif isinstance(module, RMSNorm):
+            nn.init.ones_(module.weight)
+
+    # ========================================================
+    # FORWARD
+    # ========================================================
+
+    def forward(self, input_ids):
+
+        # ----------------------------------------------------
+        # Input:
+        #
+        # [B, S]
+        #
+        # ----------------------------------------------------
+
+        batch_size, seq_len = input_ids.shape
+
+        # ----------------------------------------------------
+        # Model-level input checks
+        # ----------------------------------------------------
+
+        assert seq_len <= self.max_seq_len, (
+            f"Sequence length {seq_len} exceeds "
+            f"max_seq_len {self.max_seq_len}"
+        )
+
+        assert input_ids.dtype in (
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        ), (
+            "input_ids must contain integer token IDs"
+        )
+
+        assert torch.all(input_ids >= 0), (
+            "input_ids contains a negative token ID"
+        )
+
+        assert torch.all(input_ids < self.vocab_size), (
+            "input_ids contains a token ID >= vocab_size"
+        )
+
+        # ----------------------------------------------------
+        # Token embedding
+        #
+        # [B, S]
+        # ->
+        # [B, S, D]
+        # ----------------------------------------------------
+
+        x = self.embed_tokens(input_ids)
+
+        # ----------------------------------------------------
+        # Input dropout
+        # ----------------------------------------------------
+
+        x = self.embed_dropout(x)
+
+        # ----------------------------------------------------
+        # Transformer blocks
+        # ----------------------------------------------------
+
+        for layer in self.layers:
+            x = layer(x)
+
+        # ----------------------------------------------------
+        # Final normalization
+        # ----------------------------------------------------
+
+        x = self.final_layernorm(x)
+
+        # ----------------------------------------------------
+        # Language-model head
+        #
+        # [B, S, D]
+        # ->
+        # [B, S, V]
+        # ----------------------------------------------------
+
+        logits = self.lm_head(x)
+
+        return logits
