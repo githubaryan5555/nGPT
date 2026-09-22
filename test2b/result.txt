@@ -1,0 +1,3 @@
+making a model independent train py will be impossible for large architectures
+trianpy and modelpy types must adapt
+FAIL
