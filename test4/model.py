@@ -840,3 +840,37 @@ class Model5555LM(nn.Module):
             )
 
         print("=" * 64)
+    
+
+
+    @torch.no_grad()
+    def generate(
+        self,
+        text,
+        tokenizer,
+        max_new_tokens=100,
+        temperature=1.0,
+        top_k=None,
+        top_p=None,
+        eos_token_id=None,
+    ):
+        self.eval()
+
+        assert isinstance(text, str)
+        assert max_new_tokens >= 0
+        assert temperature > 0
+
+        device = next(self.parameters()).device
+
+        input_ids = tokenizer.encode(text)
+
+        input_ids = torch.tensor(
+            [input_ids],
+            dtype=torch.long,
+            device=device,
+        )
+
+        for _ in range(max_new_tokens):
+            input_ids_cond = input_ids[:, -self.config.max_seq_len:]
+
+            logits = self(input_ids_cond)
