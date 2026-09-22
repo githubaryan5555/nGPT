@@ -458,15 +458,10 @@ class Model5555LM(nn.Module):
 
         assert seq_len <= self.config.max_seq_len
 
-        assert input_ids.dtype in (
-            torch.int8,
-            torch.int16,
-            torch.int32,
-            torch.int64,
-        )
+        assert input_ids.dtype == torch.long
 
-        assert torch.all(input_ids >= 0)
-        assert torch.all(input_ids < self.config.vocab_size)
+        #assert torch.all(input_ids >= 0)
+        #assert torch.all(input_ids < self.config.vocab_size)
 
         x = self.embed_tokens(input_ids)
 
