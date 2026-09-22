@@ -1,0 +1,29 @@
+{
+  "tokenizer_type": "byte_level_bpe",
+  "vocab_size": 8192,
+  "byte_vocab": {
+    "start_id": 0,
+    "end_id": 255,
+    "size": 256
+  },
+  "special_tokens": {
+    "unk_token": "[-UNK-]",
+    "unk_token_id": 256,
+    "bos_token": "[-BOS-]",
+    "bos_token_id": 257,
+    "eos_token": "[-EOS-]",
+    "eos_token_id": 258
+  },
+  "learned_tokens": {
+    "start_id": 259,
+    "end_id": 8191,
+    "size": 7933
+  },
+  "pre_tokenizer": "ByteLevel",
+  "decoder": "ByteLevel",
+  "training": {
+    "input_file": "fineweb_sample.txt",
+    "train_ratio": 0.9,
+    "min_frequency": 2
+  }
+}
