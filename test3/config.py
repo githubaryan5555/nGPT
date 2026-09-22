@@ -65,7 +65,7 @@ block_size = max_seq_len
 max_iters = 1000
 
 eval_interval = 100
-eval_iters = 20
+eval_iters = 25
 log_interval = 10
 
 
@@ -99,7 +99,7 @@ min_lr = 5e-4
 # ============================================================
 
 device = "cuda"
-dtype = "float32"
+dtype = "float16"
 
 
 # ============================================================
@@ -123,7 +123,7 @@ init_from = "scratch"
 # COMPILE
 # ============================================================
 
-compile = False
+compile = True
 compile_mode = "default"
 
 
