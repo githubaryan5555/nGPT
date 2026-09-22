@@ -1,0 +1,456 @@
+Cloning into 'nGPT'...
+remote: Enumerating objects: 989, done.
+remote: Counting objects: 100% (98/98), done.
+remote: Compressing objects: 100% (7/7), done.
+remote: Total 989 (delta 94), reused 91 (delta 91), pack-reused 891 (from 2)
+Receiving objects: 100% (989/989), 8.22 MiB | 10.89 MiB/s, done.
+Resolving deltas: 100% (523/523), done.
+/content/nGPT/test3
+device: cuda
+dtype:  torch.float16
+train tokens: 5,042,694
+val tokens:   563,280
+parameters: 14,164,224
+compiling model...
+W0922 13:25:10.983000 662 torch/_inductor/utils.py:1731] [0/0] Not enough SMs to use max_autotune_gemm mode
+iter     0 | loss 9.0533 | lr 2e-05 | time 54.30s
+eval     0 | train 9.0305 | val 9.0331
+saved checkpoint: out/ckpt.pt
+iter    10 | loss 8.5216 | lr 0.00022 | time 4.75s
+iter    20 | loss 7.9178 | lr 0.00042 | time 4.85s
+iter    30 | loss 7.3835 | lr 0.00062 | time 4.98s
+iter    40 | loss 7.2474 | lr 0.00082 | time 5.14s
+iter    50 | loss 7.1406 | lr 0.001 | time 5.18s
+iter    60 | loss 6.9899 | lr 0.000999863 | time 5.18s
+iter    70 | loss 6.7922 | lr 0.000999453 | time 5.21s
+iter    80 | loss 6.5839 | lr 0.000998771 | time 5.26s
+iter    90 | loss 6.3963 | lr 0.000997816 | time 5.28s
+iter   100 | loss 6.2482 | lr 0.00099659 | time 5.27s
+eval   100 | train 6.2315 | val 6.3186
+saved checkpoint: out/ckpt.pt
+iter   110 | loss 6.1204 | lr 0.000995095 | time 5.26s
+iter   120 | loss 6.0177 | lr 0.000993332 | time 5.27s
+iter   130 | loss 5.9033 | lr 0.000991302 | time 5.27s
+iter   140 | loss 5.8074 | lr 0.000989009 | time 5.27s
+iter   150 | loss 5.7093 | lr 0.000986454 | time 5.27s
+iter   160 | loss 5.6146 | lr 0.000983641 | time 5.28s
+iter   170 | loss 5.5377 | lr 0.000980572 | time 5.29s
+iter   180 | loss 5.4568 | lr 0.000977252 | time 5.29s
+iter   190 | loss 5.3536 | lr 0.000973682 | time 5.29s
+iter   200 | loss 5.3006 | lr 0.000969868 | time 5.29s
+eval   200 | train 5.2878 | val 5.4358
+saved checkpoint: out/ckpt.pt
+iter   210 | loss 5.2125 | lr 0.000965814 | time 5.28s
+iter   220 | loss 5.1501 | lr 0.000961524 | time 5.30s
+iter   230 | loss 5.0624 | lr 0.000957002 | time 5.28s
+iter   240 | loss 4.9902 | lr 0.000952254 | time 5.28s
+iter   250 | loss 4.9281 | lr 0.000947285 | time 5.30s
+iter   260 | loss 4.8549 | lr 0.0009421 | time 5.33s
+iter   270 | loss 4.7944 | lr 0.000936705 | time 5.33s
+iter   280 | loss 4.7348 | lr 0.000931106 | time 5.32s
+iter   290 | loss 4.6766 | lr 0.000925309 | time 5.30s
+iter   300 | loss 4.6123 | lr 0.00091932 | time 5.31s
+eval   300 | train 4.6049 | val 4.8866
+saved checkpoint: out/ckpt.pt
+iter   310 | loss 4.5656 | lr 0.000913146 | time 5.31s
+iter   320 | loss 4.5263 | lr 0.000906794 | time 5.32s
+iter   330 | loss 4.4419 | lr 0.00090027 | time 5.33s
+iter   340 | loss 4.4196 | lr 0.000893582 | time 5.33s
+iter   350 | loss 4.3454 | lr 0.000886737 | time 5.32s
+iter   360 | loss 4.3152 | lr 0.000879742 | time 5.33s
+iter   370 | loss 4.2661 | lr 0.000872606 | time 5.33s
+iter   380 | loss 4.2141 | lr 0.000865335 | time 5.32s
+iter   390 | loss 4.1702 | lr 0.000857939 | time 5.33s
+iter   400 | loss 4.1400 | lr 0.000850424 | time 5.33s
+eval   400 | train 4.1297 | val 4.6914
+saved checkpoint: out/ckpt.pt
+iter   410 | loss 4.1088 | lr 0.000842799 | time 5.31s
+iter   420 | loss 4.0591 | lr 0.000835073 | time 5.29s
+iter   430 | loss 4.0141 | lr 0.000827254 | time 5.29s
+iter   440 | loss 3.9628 | lr 0.000819351 | time 5.32s
+iter   450 | loss 3.9220 | lr 0.000811371 | time 5.33s
+iter   460 | loss 3.8823 | lr 0.000803325 | time 5.32s
+iter   470 | loss 3.8262 | lr 0.00079522 | time 5.30s
+iter   480 | loss 3.7984 | lr 0.000787066 | time 5.30s
+iter   490 | loss 3.7755 | lr 0.000778871 | time 5.33s
+iter   500 | loss 3.7218 | lr 0.000770645 | time 5.32s
+eval   500 | train 3.7152 | val 4.7439
+iter   510 | loss 3.6970 | lr 0.000762396 | time 5.32s
+iter   520 | loss 3.6623 | lr 0.000754133 | time 5.30s
+iter   530 | loss 3.6237 | lr 0.000745867 | time 5.29s
+iter   540 | loss 3.5868 | lr 0.000737604 | time 5.28s
+iter   550 | loss 3.5472 | lr 0.000729355 | time 5.29s
+iter   560 | loss 3.5051 | lr 0.000721129 | time 5.29s
+iter   570 | loss 3.4578 | lr 0.000712934 | time 5.32s
+iter   580 | loss 3.4300 | lr 0.00070478 | time 5.32s
+iter   590 | loss 3.3952 | lr 0.000696675 | time 5.33s
+iter   600 | loss 3.3869 | lr 0.000688629 | time 5.33s
+eval   600 | train 3.3701 | val 4.9624
+iter   610 | loss 3.3375 | lr 0.000680649 | time 5.33s
+iter   620 | loss 3.3175 | lr 0.000672746 | time 5.33s
+iter   630 | loss 3.2756 | lr 0.000664927 | time 5.31s
+iter   640 | loss 3.2429 | lr 0.000657201 | time 5.30s
+iter   650 | loss 3.2231 | lr 0.000649576 | time 5.30s
+iter   660 | loss 3.1912 | lr 0.000642061 | time 5.29s
+iter   670 | loss 3.1771 | lr 0.000634665 | time 5.32s
+iter   680 | loss 3.1346 | lr 0.000627394 | time 5.32s
+iter   690 | loss 3.1124 | lr 0.000620258 | time 5.33s
+iter   700 | loss 3.0662 | lr 0.000613263 | time 5.32s
+eval   700 | train 3.0759 | val 5.2298
+iter   710 | loss 3.0422 | lr 0.000606418 | time 5.29s
+iter   720 | loss 3.0231 | lr 0.00059973 | time 5.32s
+iter   730 | loss 3.0044 | lr 0.000593206 | time 5.33s
+iter   740 | loss 2.9825 | lr 0.000586854 | time 5.30s
+iter   750 | loss 2.9412 | lr 0.00058068 | time 5.30s
+iter   760 | loss 2.9137 | lr 0.000574691 | time 5.29s
+iter   770 | loss 2.8933 | lr 0.000568894 | time 5.29s
+iter   780 | loss 2.8695 | lr 0.000563295 | time 5.30s
+iter   790 | loss 2.8433 | lr 0.0005579 | time 5.31s
+iter   800 | loss 2.8204 | lr 0.000552715 | time 5.31s
+eval   800 | train 2.8092 | val 5.5527
+iter   810 | loss 2.7961 | lr 0.000547746 | time 5.30s
+iter   820 | loss 2.7907 | lr 0.000542998 | time 5.29s
+iter   830 | loss 2.7397 | lr 0.000538476 | time 5.30s
+iter   840 | loss 2.7268 | lr 0.000534186 | time 5.31s
+iter   850 | loss 2.7072 | lr 0.000530132 | time 5.32s
+iter   860 | loss 2.6863 | lr 0.000526318 | time 5.32s
+iter   870 | loss 2.6797 | lr 0.000522748 | time 5.30s
+iter   880 | loss 2.6498 | lr 0.000519428 | time 5.32s
+lost...??? 
+
+Checkpoint type: <class 'dict'>  
+  
+Searching for FFN/SwiGLU projection weights...  
+  
+_orig_mod.layers.0.mlp.gate_proj.weight                      shape=(768, 256)  
+_orig_mod.layers.0.mlp.up_proj.weight                        shape=(768, 256)  
+_orig_mod.layers.0.mlp.down_proj.weight                      shape=(256, 768)  
+_orig_mod.layers.1.mlp.gate_proj.weight                      shape=(768, 256)  
+_orig_mod.layers.1.mlp.up_proj.weight                        shape=(768, 256)  
+_orig_mod.layers.1.mlp.down_proj.weight                      shape=(256, 768)  
+_orig_mod.layers.2.mlp.gate_proj.weight                      shape=(768, 256)  
+_orig_mod.layers.2.mlp.up_proj.weight                        shape=(768, 256)  
+_orig_mod.layers.2.mlp.down_proj.weight                      shape=(256, 768)  
+_orig_mod.layers.3.mlp.gate_proj.weight                      shape=(768, 256)  
+_orig_mod.layers.3.mlp.up_proj.weight                        shape=(768, 256)  
+_orig_mod.layers.3.mlp.down_proj.weight                      shape=(256, 768)  
+_orig_mod.layers.4.mlp.gate_proj.weight                      shape=(768, 256)  
+_orig_mod.layers.4.mlp.up_proj.weight                        shape=(768, 256)  
+_orig_mod.layers.4.mlp.down_proj.weight                      shape=(256, 768)  
+_orig_mod.layers.5.mlp.gate_proj.weight                      shape=(768, 256)  
+_orig_mod.layers.5.mlp.up_proj.weight                        shape=(768, 256)  
+_orig_mod.layers.5.mlp.down_proj.weight                      shape=(256, 768)  
+_orig_mod.layers.6.mlp.gate_proj.weight                      shape=(768, 256)  
+_orig_mod.layers.6.mlp.up_proj.weight                        shape=(768, 256)  
+_orig_mod.layers.6.mlp.down_proj.weight                      shape=(256, 768)  
+_orig_mod.layers.7.mlp.gate_proj.weight                      shape=(768, 256)  
+_orig_mod.layers.7.mlp.up_proj.weight                        shape=(768, 256)  
+_orig_mod.layers.7.mlp.down_proj.weight                      shape=(256, 768)  
+_orig_mod.layers.8.mlp.gate_proj.weight                      shape=(768, 256)  
+_orig_mod.layers.8.mlp.up_proj.weight                        shape=(768, 256)  
+_orig_mod.layers.8.mlp.down_proj.weight                      shape=(256, 768)  
+_orig_mod.layers.9.mlp.gate_proj.weight                      shape=(768, 256)  
+_orig_mod.layers.9.mlp.up_proj.weight                        shape=(768, 256)  
+_orig_mod.layers.9.mlp.down_proj.weight                      shape=(256, 768)  
+_orig_mod.layers.10.mlp.gate_proj.weight                     shape=(768, 256)  
+_orig_mod.layers.10.mlp.up_proj.weight                       shape=(768, 256)  
+_orig_mod.layers.10.mlp.down_proj.weight                     shape=(256, 768)  
+_orig_mod.layers.11.mlp.gate_proj.weight                     shape=(768, 256)  
+_orig_mod.layers.11.mlp.up_proj.weight                       shape=(768, 256)  
+_orig_mod.layers.11.mlp.down_proj.weight                     shape=(256, 768)  
+_orig_mod.layers.12.mlp.gate_proj.weight                     shape=(768, 256)  
+_orig_mod.layers.12.mlp.up_proj.weight                       shape=(768, 256)  
+_orig_mod.layers.12.mlp.down_proj.weight                     shape=(256, 768)  
+_orig_mod.layers.13.mlp.gate_proj.weight                     shape=(768, 256)  
+_orig_mod.layers.13.mlp.up_proj.weight                       shape=(768, 256)  
+_orig_mod.layers.13.mlp.down_proj.weight                     shape=(256, 768)  
+_orig_mod.layers.14.mlp.gate_proj.weight                     shape=(768, 256)  
+_orig_mod.layers.14.mlp.up_proj.weight                       shape=(768, 256)  
+_orig_mod.layers.14.mlp.down_proj.weight                     shape=(256, 768)  
+_orig_mod.layers.15.mlp.gate_proj.weight                     shape=(768, 256)  
+_orig_mod.layers.15.mlp.up_proj.weight                       shape=(768, 256)  
+_orig_mod.layers.15.mlp.down_proj.weight                     shape=(256, 768)  
+  
+============================================================  
+INFERRED INTERMEDIATE SIZE  
+============================================================  
+Hidden size       : 256  
+Intermediate size : 768  
+Projection        : _orig_mod.layers.0.mlp.gate_proj.weight
+
+Cloning into 'nGPT'...
+remote: Enumerating objects: 989, done.
+remote: Counting objects: 100% (98/98), done.
+remote: Compressing objects: 100% (7/7), done.
+remote: Total 989 (delta 94), reused 91 (delta 91), pack-reused 891 (from 2)
+Receiving objects: 100% (989/989), 8.22 MiB | 10.89 MiB/s, done.
+Resolving deltas: 100% (523/523), done.
+/content/nGPT/test3
+device: cuda
+dtype:  torch.float16
+train tokens: 5,042,694
+val tokens:   563,280
+parameters: 14,164,224
+compiling model...
+W0922 13:25:10.983000 662 torch/_inductor/utils.py:1731] [0/0] Not enough SMs to use max_autotune_gemm mode
+iter     0 | loss 9.0533 | lr 2e-05 | time 54.30s
+eval     0 | train 9.0305 | val 9.0331
+saved checkpoint: out/ckpt.pt
+iter    10 | loss 8.5216 | lr 0.00022 | time 4.75s
+iter    20 | loss 7.9178 | lr 0.00042 | time 4.85s
+iter    30 | loss 7.3835 | lr 0.00062 | time 4.98s
+iter    40 | loss 7.2474 | lr 0.00082 | time 5.14s
+iter    50 | loss 7.1406 | lr 0.001 | time 5.18s
+iter    60 | loss 6.9899 | lr 0.000999863 | time 5.18s
+iter    70 | loss 6.7922 | lr 0.000999453 | time 5.21s
+iter    80 | loss 6.5839 | lr 0.000998771 | time 5.26s
+iter    90 | loss 6.3963 | lr 0.000997816 | time 5.28s
+iter   100 | loss 6.2482 | lr 0.00099659 | time 5.27s
+eval   100 | train 6.2315 | val 6.3186
+saved checkpoint: out/ckpt.pt
+iter   110 | loss 6.1204 | lr 0.000995095 | time 5.26s
+iter   120 | loss 6.0177 | lr 0.000993332 | time 5.27s
+iter   130 | loss 5.9033 | lr 0.000991302 | time 5.27s
+iter   140 | loss 5.8074 | lr 0.000989009 | time 5.27s
+iter   150 | loss 5.7093 | lr 0.000986454 | time 5.27s
+iter   160 | loss 5.6146 | lr 0.000983641 | time 5.28s
+iter   170 | loss 5.5377 | lr 0.000980572 | time 5.29s
+iter   180 | loss 5.4568 | lr 0.000977252 | time 5.29s
+iter   190 | loss 5.3536 | lr 0.000973682 | time 5.29s
+iter   200 | loss 5.3006 | lr 0.000969868 | time 5.29s
+eval   200 | train 5.2878 | val 5.4358
+saved checkpoint: out/ckpt.pt
+iter   210 | loss 5.2125 | lr 0.000965814 | time 5.28s
+iter   220 | loss 5.1501 | lr 0.000961524 | time 5.30s
+iter   230 | loss 5.0624 | lr 0.000957002 | time 5.28s
+iter   240 | loss 4.9902 | lr 0.000952254 | time 5.28s
+iter   250 | loss 4.9281 | lr 0.000947285 | time 5.30s
+iter   260 | loss 4.8549 | lr 0.0009421 | time 5.33s
+iter   270 | loss 4.7944 | lr 0.000936705 | time 5.33s
+iter   280 | loss 4.7348 | lr 0.000931106 | time 5.32s
+iter   290 | loss 4.6766 | lr 0.000925309 | time 5.30s
+iter   300 | loss 4.6123 | lr 0.00091932 | time 5.31s
+eval   300 | train 4.6049 | val 4.8866
+saved checkpoint: out/ckpt.pt
+iter   310 | loss 4.5656 | lr 0.000913146 | time 5.31s
+iter   320 | loss 4.5263 | lr 0.000906794 | time 5.32s
+iter   330 | loss 4.4419 | lr 0.00090027 | time 5.33s
+iter   340 | loss 4.4196 | lr 0.000893582 | time 5.33s
+iter   350 | loss 4.3454 | lr 0.000886737 | time 5.32s
+iter   360 | loss 4.3152 | lr 0.000879742 | time 5.33s
+iter   370 | loss 4.2661 | lr 0.000872606 | time 5.33s
+iter   380 | loss 4.2141 | lr 0.000865335 | time 5.32s
+iter   390 | loss 4.1702 | lr 0.000857939 | time 5.33s
+iter   400 | loss 4.1400 | lr 0.000850424 | time 5.33s
+eval   400 | train 4.1297 | val 4.6914
+saved checkpoint: out/ckpt.pt
+iter   410 | loss 4.1088 | lr 0.000842799 | time 5.31s
+iter   420 | loss 4.0591 | lr 0.000835073 | time 5.29s
+iter   430 | loss 4.0141 | lr 0.000827254 | time 5.29s
+iter   440 | loss 3.9628 | lr 0.000819351 | time 5.32s
+iter   450 | loss 3.9220 | lr 0.000811371 | time 5.33s
+iter   460 | loss 3.8823 | lr 0.000803325 | time 5.32s
+iter   470 | loss 3.8262 | lr 0.00079522 | time 5.30s
+iter   480 | loss 3.7984 | lr 0.000787066 | time 5.30s
+iter   490 | loss 3.7755 | lr 0.000778871 | time 5.33s
+iter   500 | loss 3.7218 | lr 0.000770645 | time 5.32s
+eval   500 | train 3.7152 | val 4.7439
+iter   510 | loss 3.6970 | lr 0.000762396 | time 5.32s
+iter   520 | loss 3.6623 | lr 0.000754133 | time 5.30s
+iter   530 | loss 3.6237 | lr 0.000745867 | time 5.29s
+iter   540 | loss 3.5868 | lr 0.000737604 | time 5.28s
+iter   550 | loss 3.5472 | lr 0.000729355 | time 5.29s
+iter   560 | loss 3.5051 | lr 0.000721129 | time 5.29s
+iter   570 | loss 3.4578 | lr 0.000712934 | time 5.32s
+iter   580 | loss 3.4300 | lr 0.00070478 | time 5.32s
+iter   590 | loss 3.3952 | lr 0.000696675 | time 5.33s
+iter   600 | loss 3.3869 | lr 0.000688629 | time 5.33s
+eval   600 | train 3.3701 | val 4.9624
+iter   610 | loss 3.3375 | lr 0.000680649 | time 5.33s
+iter   620 | loss 3.3175 | lr 0.000672746 | time 5.33s
+iter   630 | loss 3.2756 | lr 0.000664927 | time 5.31s
+iter   640 | loss 3.2429 | lr 0.000657201 | time 5.30s
+iter   650 | loss 3.2231 | lr 0.000649576 | time 5.30s
+iter   660 | loss 3.1912 | lr 0.000642061 | time 5.29s
+iter   670 | loss 3.1771 | lr 0.000634665 | time 5.32s
+iter   680 | loss 3.1346 | lr 0.000627394 | time 5.32s
+iter   690 | loss 3.1124 | lr 0.000620258 | time 5.33s
+iter   700 | loss 3.0662 | lr 0.000613263 | time 5.32s
+eval   700 | train 3.0759 | val 5.2298
+iter   710 | loss 3.0422 | lr 0.000606418 | time 5.29s
+iter   720 | loss 3.0231 | lr 0.00059973 | time 5.32s
+iter   730 | loss 3.0044 | lr 0.000593206 | time 5.33s
+iter   740 | loss 2.9825 | lr 0.000586854 | time 5.30s
+iter   750 | loss 2.9412 | lr 0.00058068 | time 5.30s
+iter   760 | loss 2.9137 | lr 0.000574691 | time 5.29s
+iter   770 | loss 2.8933 | lr 0.000568894 | time 5.29s
+iter   780 | loss 2.8695 | lr 0.000563295 | time 5.30s
+iter   790 | loss 2.8433 | lr 0.0005579 | time 5.31s
+iter   800 | loss 2.8204 | lr 0.000552715 | time 5.31s
+eval   800 | train 2.8092 | val 5.5527
+iter   810 | loss 2.7961 | lr 0.000547746 | time 5.30s
+iter   820 | loss 2.7907 | lr 0.000542998 | time 5.29s
+iter   830 | loss 2.7397 | lr 0.000538476 | time 5.30s
+iter   840 | loss 2.7268 | lr 0.000534186 | time 5.31s
+iter   850 | loss 2.7072 | lr 0.000530132 | time 5.32s
+iter   860 | loss 2.6863 | lr 0.000526318 | time 5.32s
+iter   870 | loss 2.6797 | lr 0.000522748 | time 5.30s
+iter   880 | loss 2.6498 | lr 0.000519428 | time 5.32s
+iter   890 | loss 2.6286 | lr 0.000516359 | time 5.31s
+iter   900 | loss 2.6077 | lr 0.000513546 | time 5.33s
+eval   900 | train 2.5947 | val 5.8824
+iter   910 | loss 2.5795 | lr 0.000510991 | time 5.32s
+iter   920 | loss 2.5615 | lr 0.000508698 | time 5.31s
+iter   930 | loss 2.5559 | lr 0.000506668 | time 5.30s
+iter   940 | loss 2.5369 | lr 0.000504905 | time 5.30s
+iter   950 | loss 2.5084 | lr 0.00050341 | time 5.30s
+iter   960 | loss 2.5019 | lr 0.000502184 | time 5.30s
+iter   970 | loss 2.4934 | lr 0.000501229 | time 5.29s
+iter   980 | loss 2.4534 | lr 0.000500547 | time 5.29s
+iter   990 | loss 2.4599 | lr 0.000500137 | time 5.29s
+eval   999 | train 2.4380 | val 6.1676
+training complete.
+
+```
+============================================================
+VRAM BEFORE GENERATION
+============================================================
+allocated : 35.39 MB
+reserved  : 68.00 MB
+
+Warming up...
+Benchmarking generation...
+
+============================================================
+INFERENCE BENCHMARK
+============================================================
+GPU              : Tesla T4
+Generated tokens : 100
+Time             : 1.756 sec
+Tokens/sec       : 56.95
+
+VRAM
+------------------------------------------------------------
+Current allocated : 37.47 MB
+Current reserved  : 68.00 MB
+Peak allocated    : 39.13 MB
+Peak reserved     : 68.00 MB
+Total GPU VRAM    : 14,912.69 MB
+
+VRAM peak usage   : 0.26%
+============================================================
+```
+
+Loading tokenizer...
+vocab size: 8192
+
+Loading model...
+missing keys   : 0
+unexpected keys: 0
+
+============================================================
+MODEL READY
+
+device : cuda
+dtype  : torch.float16
+layers : 16
+hidden : 256
+FFN    : 768
+heads  : 8
+KV     : 2
+params : 14164224
+
+============================================================
+GENERATING
+
+prompt: 'The quick brown fox'
+
+The quick brown fox is so easy for getting a new batch. This will also be used in a large number of different types, but the result is easy and easy.
+Browse the full installation in the "bound" button, with the top-provide of all parts.
+
+Dearn more >>
+I know that it's all the best thing to do.
+I'm still going to get out as long as I'll be in at the same time, and I can
+
+Loading tokenizer...
+vocab size: 8192
+
+Loading model...
+
+============================================================
+MODEL READY
+
+device     : cuda
+dtype      : torch.float16
+parameters : 14,164,224
+layers     : 16
+hidden     : 256
+FFN        : 768
+heads      : 8
+KV heads   : 2
+
+============================================================
+GENERATIONS
+
+[1] PROMPT
+The quick brown fox
+
+OUTPUT
+
+of pan, lined with a stem.
+In the end, I am very excited to do this at the back of the morning. If you want to have the time with a car, it’s to be on a piece of this and it is still quite a bit more and more intense with this.
+Best for a few minutes about the Breakfast and the Tools of Sweet
+
+It’s the best way to find out a bit of a new meal. The weather is always the most important thing.
+A lot of a good time.
+Consider the time you are in the carrier!
+If you have any such fruits in your space, you can use these
+
+[2] PROMPT
+Once upon a time
+
+OUTPUT
+
+, it is that it can just be done in the morning.
+I saw the man in an interview with Kalum, because a new woman with a child and a family of a lady who said he was just a child in the hospital, and he was on a stomach.
+Biggians were really happy and really fierce, but she was one of my husband and I would have made that great care for me. When I was a teacher, I was a writer.
+I can still say I have a new child. I really am a fan of the school. And that is the way I should have used it.
+Earlier this year, my son had been a teacher. She was
+
+[3] PROMPT
+The most important thing about computers is
+
+OUTPUT
+
+available.
+
+The current information is an extra tub:
+
+In-bay.org or the latest version of the site.
+Tags: 53% of your iPod
+Tax and Web users are on the SourceLogic.com.
+The following list is available in a Facebook Page for more information and to access our website.
+
+Batch this link to help users and subscribe the page.
+
+Use it to see the "DailyMate" button.
+
+The original name is on the site and the
+
+Five links to the full-time content, including a free-poor.
+
+Cooking for your product
+
+Except for this list
+
+
+
+---
+
+[4] PROMPT
+In the future, artificial intelligence will
+
+OUTPUT
+
+be more important than that, and that we will be looking forward to the fact that we have a big problem of the issue of the question that is a major solution. The more unlaid-laid design that doesn't really do, but there's nothing more.
+A. One of the two things that are the best of the time. A woman is a very dime-down, one of which shows the fact that the "subsure" and "slee on the 'cub' of the film, the "golden" or "display" the "child of his own. The film was "temporary" because of the film "Bee Lo Green". "Mess
