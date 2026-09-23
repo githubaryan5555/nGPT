@@ -835,8 +835,17 @@ class Model5555LM(nn.Module):
             )
 
         print("=" * 64)
-    
 
+
+            # ========================================================
+    # GENERATION
+    # ========================================================
+
+
+
+    # ========================================================
+    # GENERATION
+    # ========================================================
 
     @torch.no_grad()
     def generate(
@@ -851,21 +860,214 @@ class Model5555LM(nn.Module):
     ):
         self.eval()
 
+        # ----------------------------------------------------
+        # VALIDATION
+        # ----------------------------------------------------
+
         assert isinstance(text, str)
         assert max_new_tokens >= 0
         assert temperature > 0
 
-        device = next(self.parameters()).device
+        if top_k is not None:
+            assert isinstance(top_k, int)
+            assert top_k > 0
+
+        if top_p is not None:
+            assert 0.0 < top_p <= 1.0
+
+        if eos_token_id is not None:
+            assert isinstance(eos_token_id, int)
+            assert 0 <= eos_token_id < self.config.vocab_size
+
+        # ----------------------------------------------------
+        # TOKENIZE PROMPT
+        # ----------------------------------------------------
 
         input_ids = tokenizer.encode(text)
 
-        input_ids = torch.tensor(
-            [input_ids],
+        if not isinstance(input_ids, torch.Tensor):
+            input_ids = torch.tensor(
+                input_ids,
+                dtype=torch.long,
+            )
+
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        input_ids = input_ids.to(
+            device=self.embed_tokens.weight.device,
             dtype=torch.long,
-            device=device,
         )
 
-        for _ in range(max_new_tokens):
-            input_ids_cond = input_ids[:, -self.config.max_seq_len:]
+        # ----------------------------------------------------
+        # EMPTY PROMPT CHECK
+        # ----------------------------------------------------
 
-            logits = self(input_ids_cond)
+        if input_ids.shape[1] == 0:
+            raise ValueError(
+                "Prompt tokenization produced zero tokens."
+            )
+
+        # ----------------------------------------------------
+        # CONTEXT LENGTH CHECK
+        # ----------------------------------------------------
+
+        if input_ids.shape[1] > self.config.max_seq_len:
+            input_ids = input_ids[
+                :, -self.config.max_seq_len:
+            ]
+
+        # ----------------------------------------------------
+        # GENERATION LOOP
+        # ----------------------------------------------------
+
+        for _ in range(max_new_tokens):
+
+            # Keep only the model's supported context.
+            idx_cond = input_ids[
+                :, -self.config.max_seq_len:
+            ]
+
+            # ------------------------------------------------
+            # FORWARD
+            # ------------------------------------------------
+
+            logits = self(idx_cond)
+
+            # Only the final position predicts the next token.
+            logits = logits[:, -1, :]
+
+            # ------------------------------------------------
+            # TEMPERATURE
+            # ------------------------------------------------
+
+            logits = logits / temperature
+
+            # ------------------------------------------------
+            # TOP-K
+            # ------------------------------------------------
+
+            if top_k is not None:
+
+                k = min(
+                    top_k,
+                    logits.shape[-1],
+                )
+
+                values, _ = torch.topk(
+                    logits,
+                    k=k,
+                    dim=-1,
+                )
+
+                threshold = values[:, [-1]]
+
+                logits = torch.where(
+                    logits < threshold,
+                    torch.full_like(
+                        logits,
+                        float("-inf"),
+                    ),
+                    logits,
+                )
+
+            # ------------------------------------------------
+            # TOP-P / NUCLEUS SAMPLING
+            # ------------------------------------------------
+
+            if top_p is not None and top_p < 1.0:
+
+                sorted_logits, sorted_indices = torch.sort(
+                    logits,
+                    descending=True,
+                    dim=-1,
+                )
+
+                sorted_probs = F.softmax(
+                    sorted_logits,
+                    dim=-1,
+                )
+
+                cumulative_probs = torch.cumsum(
+                    sorted_probs,
+                    dim=-1,
+                )
+
+                # Remove tokens once cumulative probability
+                # exceeds top_p.
+                sorted_remove = (
+                    cumulative_probs > top_p
+                )
+
+                # Keep the first token above the threshold.
+                sorted_remove[:, 1:] = (
+                    sorted_remove[:, :-1].clone()
+                )
+
+                sorted_remove[:, 0] = False
+
+                logits_to_remove = torch.zeros_like(
+                    logits,
+                    dtype=torch.bool,
+                )
+
+                logits_to_remove.scatter_(
+                    dim=-1,
+                    index=sorted_indices,
+                    src=sorted_remove,
+                )
+
+                logits = logits.masked_fill(
+                    logits_to_remove,
+                    float("-inf"),
+                )
+
+            # ------------------------------------------------
+            # SAMPLE NEXT TOKEN
+            # ------------------------------------------------
+
+            probs = F.softmax(
+                logits,
+                dim=-1,
+            )
+
+            next_token = torch.multinomial(
+                probs,
+                num_samples=1,
+            )
+
+            # ------------------------------------------------
+            # APPEND
+            # ------------------------------------------------
+
+            input_ids = torch.cat(
+                [
+                    input_ids,
+                    next_token,
+                ],
+                dim=1,
+            )
+
+            # ------------------------------------------------
+            # EOS
+            # ------------------------------------------------
+
+            if (
+                eos_token_id is not None
+                and torch.all(
+                    next_token == eos_token_id
+                )
+            ):
+                break
+
+        # ----------------------------------------------------
+        # DECODE
+        # ----------------------------------------------------
+
+        output_ids = input_ids[0].tolist()
+
+        output_text = tokenizer.decode(
+            output_ids
+        )
+
+        return output_text                                
