@@ -113,6 +113,7 @@ tokenizer_config = load_tokenizer_config(
 # ============================================================
 
 def find_vocab_size(data):
+
     possible_keys = (
         "vocab_size",
         "vocabulary_size",
@@ -120,6 +121,7 @@ def find_vocab_size(data):
     )
 
     for key in possible_keys:
+
         value = data.get(key)
 
         if isinstance(value, int):
@@ -131,10 +133,14 @@ def find_vocab_size(data):
         "model",
         "config",
     ):
+
         nested = data.get(key)
 
         if isinstance(nested, dict):
-            result = find_vocab_size(nested)
+
+            result = find_vocab_size(
+                nested
+            )
 
             if result is not None:
                 return result
@@ -149,6 +155,7 @@ detected_vocab_size = find_vocab_size(
 if detected_vocab_size is not None:
 
     if detected_vocab_size != cfg.vocab_size:
+
         print(
             "WARNING:"
         )
@@ -174,6 +181,7 @@ if detected_vocab_size is not None:
     )
 
 else:
+
     print(
         f"Tokenizer vocab   : "
         f"{cfg.vocab_size} "
@@ -213,12 +221,15 @@ print(
 # ============================================================
 
 if len(train_data) <= cfg.max_seq_len:
+
     raise ValueError(
         "Training dataset is smaller than "
         "max_seq_len."
     )
 
+
 if len(val_data) <= cfg.max_seq_len:
+
     raise ValueError(
         "Validation dataset is smaller than "
         "max_seq_len."
@@ -234,8 +245,13 @@ sample_count = min(
 
 train_sample = train_data[:sample_count]
 
-train_min = int(train_sample.min())
-train_max = int(train_sample.max())
+train_min = int(
+    train_sample.min()
+)
+
+train_max = int(
+    train_sample.max()
+)
 
 print(
     f"Train token range : "
@@ -243,11 +259,13 @@ print(
 )
 
 if train_min < 0:
+
     raise ValueError(
         "Negative token ID found."
     )
 
 if train_max >= cfg.vocab_size:
+
     raise ValueError(
         "Training dataset contains token IDs "
         "outside the model vocabulary."
@@ -260,7 +278,11 @@ if train_max >= cfg.vocab_size:
 
 def get_batch(data):
 
-    max_start = len(data) - cfg.max_seq_len - 1
+    max_start = (
+        len(data)
+        - cfg.max_seq_len
+        - 1
+    )
 
     ix = torch.randint(
         0,
@@ -273,9 +295,10 @@ def get_batch(data):
     x = torch.stack(
         [
             torch.from_numpy(
-                data[i:i + cfg.max_seq_len].astype(
-                    np.int64
-                )
+                data[
+                    i:
+                    i + cfg.max_seq_len
+                ].astype(np.int64)
             )
             for i in ix.tolist()
         ]
@@ -294,8 +317,14 @@ def get_batch(data):
     )
 
     return (
-        x.to(device=device, dtype=torch.long),
-        y.to(device=device, dtype=torch.long),
+        x.to(
+            device=device,
+            dtype=torch.long,
+        ),
+        y.to(
+            device=device,
+            dtype=torch.long,
+        ),
     )
 
 
@@ -331,9 +360,15 @@ model = Model5555LM(
     config=model_config
 )
 
+# IMPORTANT:
+#
+# Keep model parameters in FP32.
+#
+# Autocast will use FP16 for suitable operations while
+# parameters remain numerically stable for optimization.
+#
 model = model.to(
     device=device,
-    dtype=torch_dtype,
 )
 
 
@@ -372,12 +407,35 @@ optimizer = torch.optim.AdamW(
 
 
 # ============================================================
+# GRADIENT SCALER
+# ============================================================
+
+# FP16 needs loss scaling to avoid underflow/overflow
+# during backward propagation.
+#
+# BF16 does not normally need GradScaler.
+#
+# FP32 does not need GradScaler.
+#
+use_grad_scaler = (
+    device.type == "cuda"
+    and torch_dtype == torch.float16
+)
+
+scaler = torch.amp.GradScaler(
+    "cuda",
+    enabled=use_grad_scaler,
+)
+
+
+# ============================================================
 # LEARNING RATE
 # ============================================================
 
 def get_lr(iteration):
 
     if not cfg.lr_decay:
+
         return cfg.learning_rate
 
     # Warmup
@@ -407,7 +465,8 @@ def get_lr(iteration):
         * (
             1.0
             + math.cos(
-                math.pi * decay_ratio
+                math.pi
+                * decay_ratio
             )
         )
     )
@@ -443,6 +502,26 @@ checkpoint_path = os.path.join(
 
 
 # ============================================================
+# AUTOCAST HELPER
+# ============================================================
+
+def autocast_context():
+
+    return torch.autocast(
+        device_type=device.type,
+        dtype=torch_dtype,
+        enabled=(
+            device.type == "cuda"
+            and torch_dtype
+            in (
+                torch.float16,
+                torch.bfloat16,
+            )
+        ),
+    )
+
+
+# ============================================================
 # EVALUATION
 # ============================================================
 
@@ -463,22 +542,13 @@ def estimate_loss():
             device=device,
         )
 
-        for k in range(cfg.eval_iters):
+        for k in range(
+            cfg.eval_iters
+        ):
 
             x, y = get_batch(data)
 
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch_dtype,
-                enabled=(
-                    device.type == "cuda"
-                    and torch_dtype
-                    in (
-                        torch.float16,
-                        torch.bfloat16,
-                    )
-                ),
-            ):
+            with autocast_context():
 
                 logits = model(x)
 
@@ -509,7 +579,9 @@ if cfg.compile_model:
 
     if hasattr(torch, "compile"):
 
-        print("Compiling model...")
+        print(
+            "Compiling model..."
+        )
 
         model = torch.compile(
             model
@@ -545,9 +617,12 @@ for iteration in range(
     # LEARNING RATE
     # --------------------------------------------------------
 
-    lr = get_lr(iteration)
+    lr = get_lr(
+        iteration
+    )
 
     for param_group in optimizer.param_groups:
+
         param_group["lr"] = lr
 
     # --------------------------------------------------------
@@ -568,18 +643,7 @@ for iteration in range(
             train_data
         )
 
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch_dtype,
-            enabled=(
-                device.type == "cuda"
-                and torch_dtype
-                in (
-                    torch.float16,
-                    torch.bfloat16,
-                )
-            ),
-        ):
+        with autocast_context():
 
             logits = model(x)
 
@@ -598,7 +662,20 @@ for iteration in range(
 
         accumulated_loss += loss.item()
 
-        loss.backward()
+        # IMPORTANT:
+        # Use GradScaler for FP16 training.
+        scaler.scale(
+            loss
+        ).backward()
+
+    # --------------------------------------------------------
+    # UNSCALE GRADIENTS
+    # --------------------------------------------------------
+
+    # Gradients must be unscaled BEFORE clipping.
+    scaler.unscale_(
+        optimizer
+    )
 
     # --------------------------------------------------------
     # GRADIENT CLIPPING
@@ -606,9 +683,11 @@ for iteration in range(
 
     if cfg.grad_clip > 0:
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            cfg.grad_clip,
+        grad_norm = (
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                cfg.grad_clip,
+            )
         )
 
     else:
@@ -622,7 +701,13 @@ for iteration in range(
     # OPTIMIZER STEP
     # --------------------------------------------------------
 
-    optimizer.step()
+    # GradScaler automatically skips the optimizer step
+    # if it detects non-finite gradients.
+    scaler.step(
+        optimizer
+    )
+
+    scaler.update()
 
     # --------------------------------------------------------
     # LOGGING
@@ -678,7 +763,9 @@ for iteration in range(
 
         if should_save:
 
-            best_val_loss = losses["val"]
+            best_val_loss = (
+                losses["val"]
+            )
 
             if cfg.save_checkpoint:
 
@@ -688,8 +775,7 @@ for iteration in range(
                     "model_config": model_config.__dict__,
                     "train_config": {
                         key: value
-                        for key, value
-                        in vars(cfg).items()
+                        for key, value in vars(cfg).items()
                         if not key.startswith("__")
                     },
                     "iteration": iteration,
@@ -722,17 +808,21 @@ print("TRAINING COMPLETE")
 print("=" * 64)
 
 print(
-    f"Final step       : {cfg.max_iters - 1}"
+    f"Final step       : "
+    f"{cfg.max_iters - 1}"
 )
 
 print(
-    f"Best val loss    : {best_val_loss:.6f}"
+    f"Best val loss    : "
+    f"{best_val_loss:.6f}"
 )
 
 print(
-    f"Training time    : {elapsed:.2f} seconds"
+    f"Training time    : "
+    f"{elapsed:.2f} seconds"
 )
 
 print(
-    f"Checkpoint       : {checkpoint_path}"
-  )
+    f"Checkpoint       : "
+    f"{checkpoint_path}"
+)
