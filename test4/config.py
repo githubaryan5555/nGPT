@@ -29,7 +29,7 @@ hidden_size = 256
 
 num_hidden_layers = 16
 
-intermediate_size = 768
+intermediate_size = 1024
 
 num_attention_heads = 8
 
@@ -54,13 +54,13 @@ initializer_range = 0.02
 # TRAINING
 # ------------------------------------------------------------
 
-batch_size = 64
+batch_size = 128
 
-gradient_accumulation_steps = 1
+gradient_accumulation_steps = 16
 
-max_iters = 5000
+max_iters = 1000
 
-eval_interval = 250
+eval_interval = 100
 
 eval_iters = 50
 
