@@ -107,7 +107,7 @@ device = "cuda"
 # "bfloat16"
 dtype = "float16"
 
-compile_model = False
+compile_model = True
 
 
 # ------------------------------------------------------------
