@@ -772,4 +772,341 @@ class Model5555LM(nn.Module):
         #
         # Q: d -> d
         # K: d -> kv * head_dim
-        # V: d -> kv * he
+        # V: d -> kv * head_dim
+        # O: d -> d
+        #
+        # Multiply + add ~= 2 FLOPs.
+        # ----------------------------------------------------
+
+        projection_flops = 2 * (
+            d * d
+            + d * (kv * head_dim)
+            + d * (kv * head_dim)
+            + d * d
+        )
+
+        # ----------------------------------------------------
+        # SwiGLU
+        #
+        # gate projection
+        # up projection
+        # down projection
+        # ----------------------------------------------------
+
+        mlp_flops = 6 * d * f
+
+        # ----------------------------------------------------
+        # Attention.
+        #
+        # QK^T:
+        #   ~2 * T * T * d
+        #
+        # Attention @ V:
+        #   ~2 * T * T * d
+        #
+        # Total sequence FLOPs:
+        #   ~4 * T^2 * d
+        #
+        # Per token:
+        #   ~4 * T * d
+        # ----------------------------------------------------
+
+        attention_flops_per_token = 4 * seq_len * d
+
+        # ----------------------------------------------------
+        # Vocabulary projection.
+        # ----------------------------------------------------
+
+        lm_head_flops = 2 * d * v
+
+        per_layer = (
+            projection_flops
+            + mlp_flops
+            + attention_flops_per_token
+        )
+
+        return (
+            layers * per_layer
+            + lm_head_flops
+        )
+
+    def estimate_mfu(
+        self,
+        tokens_per_second,
+        peak_flops,
+    ):
+        """
+        Approximate Model FLOPs Utilization percentage.
+        """
+
+        if tokens_per_second < 0:
+            raise ValueError(
+                "tokens_per_second must be >= 0"
+            )
+
+        if peak_flops <= 0:
+            raise ValueError(
+                "peak_flops must be > 0"
+            )
+
+        model_flops = self.get_flops_per_token()
+
+        return (
+            tokens_per_second
+            * model_flops
+            / peak_flops
+            * 100.0
+        )
+
+    # ========================================================
+    # CONFIG
+    # ========================================================
+
+    def get_config(self):
+        return asdict(self.config)
+
+    # ========================================================
+    # GENERATION
+    # ========================================================
+
+    @torch.no_grad()
+    def generate(
+        self,
+        text,
+        tokenizer,
+        max_new_tokens=100,
+        temperature=1.0,
+        top_k=None,
+        top_p=None,
+        eos_token_id=None,
+        do_sample=True,
+    ):
+        """
+        Generate text from a string prompt.
+
+        The full generated sequence is preserved even when the
+        model has to truncate its attention context.
+        """
+
+        if not isinstance(text, str):
+            raise TypeError(
+                "text must be a string"
+            )
+
+        if not isinstance(max_new_tokens, int):
+            raise TypeError(
+                "max_new_tokens must be an int"
+            )
+
+        if max_new_tokens < 0:
+            raise ValueError(
+                "max_new_tokens must be >= 0"
+            )
+
+        if temperature <= 0:
+            raise ValueError(
+                "temperature must be > 0"
+            )
+
+        if top_k is not None:
+            if not isinstance(top_k, int) or top_k <= 0:
+                raise ValueError(
+                    "top_k must be a positive integer"
+                )
+
+        if top_p is not None:
+            if not 0 < top_p <= 1:
+                raise ValueError(
+                    "top_p must be in (0, 1]"
+                )
+
+        if eos_token_id is not None:
+            if not isinstance(eos_token_id, int):
+                raise TypeError(
+                    "eos_token_id must be an int"
+                )
+
+            if not 0 <= eos_token_id < self.config.vocab_size:
+                raise ValueError(
+                    "eos_token_id is outside vocabulary"
+                )
+
+        # ----------------------------------------------------
+        # Tokenize prompt
+        # ----------------------------------------------------
+
+        encoded = tokenizer.encode(text)
+
+        if isinstance(encoded, torch.Tensor):
+            ids = encoded.to(
+                dtype=torch.long
+            )
+        else:
+            ids = torch.tensor(
+                encoded,
+                dtype=torch.long,
+            )
+
+        if ids.ndim == 1:
+            ids = ids.unsqueeze(0)
+
+        if ids.ndim != 2:
+            raise ValueError(
+                "tokenizer.encode must return one sequence"
+            )
+
+        if ids.size(0) != 1:
+            raise ValueError(
+                "generate() only supports one prompt"
+            )
+
+        if ids.size(1) == 0:
+            raise ValueError(
+                "prompt must contain at least one token"
+            )
+
+        # Keep the complete sequence separately.
+        output_ids = ids.clone()
+
+        device = self.embed_tokens.weight.device
+
+        output_ids = output_ids.to(
+            device=device,
+            dtype=torch.long,
+        )
+
+        self.eval()
+
+        # ----------------------------------------------------
+        # Generation loop
+        # ----------------------------------------------------
+
+        for _ in range(max_new_tokens):
+
+            # Only the latest context is fed into the model.
+            context_ids = output_ids[
+                :,
+                -self.config.max_seq_len:,
+            ]
+
+            logits = self(context_ids)
+
+            # Only the final position predicts the next token.
+            logits = logits[:, -1, :]
+
+            if not do_sample:
+                next_token = logits.argmax(
+                    dim=-1,
+                    keepdim=True,
+                )
+
+            else:
+                # --------------------------------------------
+                # Temperature
+                # --------------------------------------------
+
+                logits = logits / temperature
+
+                # --------------------------------------------
+                # Top-k
+                # --------------------------------------------
+
+                if top_k is not None:
+                    k = min(
+                        top_k,
+                        logits.size(-1),
+                    )
+
+                    top_values = torch.topk(
+                        logits,
+                        k,
+                        dim=-1,
+                    ).values
+
+                    threshold = top_values[:, [-1]]
+
+                    logits = logits.masked_fill(
+                        logits < threshold,
+                        float("-inf"),
+                    )
+
+                # --------------------------------------------
+                # Top-p / nucleus sampling
+                # --------------------------------------------
+
+                if top_p is not None and top_p < 1.0:
+
+                    sorted_logits, sorted_indices = torch.sort(
+                        logits,
+                        descending=True,
+                        dim=-1,
+                    )
+
+                    sorted_probs = F.softmax(
+                        sorted_logits,
+                        dim=-1,
+                    )
+
+                    cumulative_probs = torch.cumsum(
+                        sorted_probs,
+                        dim=-1,
+                    )
+
+                    remove = cumulative_probs > top_p
+
+                    # Keep the first token above the threshold.
+                    remove[:, 1:] = remove[:, :-1].clone()
+                    remove[:, 0] = False
+
+                    sorted_logits = sorted_logits.masked_fill(
+                        remove,
+                        float("-inf"),
+                    )
+
+                    logits = torch.full_like(logits, float("-inf"))
+
+                    logits.scatter_(
+                        dim=-1,
+                        index=sorted_indices,
+                        src=sorted_logits,
+                    )
+
+                # --------------------------------------------
+                # Sample
+                # --------------------------------------------
+
+                probs = F.softmax(
+                    logits,
+                    dim=-1,
+                )
+
+                next_token = torch.multinomial(
+                    probs,
+                    num_samples=1,
+                )
+
+            # Append to complete sequence.
+            output_ids = torch.cat(
+                (
+                    output_ids,
+                    next_token,
+                ),
+                dim=1,
+            )
+
+            # Stop on EOS.
+            if (
+                eos_token_id is not None
+                and bool(
+                    (next_token == eos_token_id).all()
+                )
+            ):
+                break
+
+        # ----------------------------------------------------
+        # Decode complete sequence
+        # ----------------------------------------------------
+
+        return tokenizer.decode(
+            output_ids[0].tolist()
+        )
