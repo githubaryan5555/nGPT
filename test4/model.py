@@ -50,6 +50,8 @@ class Config:
             raise ValueError(
                 "num_attention_heads must be divisible by num_key_value_heads"
             )
+        if self.num_key_value_heads > self.num_attention_heads:
+            raise ValueError("num_key_value_heads must be <= num_attention_heads")
         if self.head_dim % 2:
             raise ValueError("head_dim must be even for RoPE")
         if self.intermediate_size <= self.hidden_size:
@@ -151,6 +153,8 @@ class GQAAttention(nn.Module):
         if attention_mask is not None:
             if attention_mask.shape != (b, t):
                 raise ValueError(f"attention_mask must have shape {(b, t)}")
+            if attention_mask.device != x.device:
+                attention_mask = attention_mask.to(device=x.device)
             if attention_mask.dtype == torch.bool:
                 valid = attention_mask
             elif attention_mask.is_floating_point() or attention_mask.dtype in (
@@ -159,9 +163,10 @@ class GQAAttention(nn.Module):
                 valid = attention_mask != 0
             else:
                 raise TypeError("attention_mask must be boolean or numeric")
-            # True means that the key may be attended to.
             causal = torch.ones((t, t), device=x.device, dtype=torch.bool).tril()
-            attn_mask = causal[None, None, :, :] & valid[:, None, None, :]
+            attn_mask = (
+                causal[None, None, :, :] & valid[:, None, None, :] & valid[:, None, :, None]
+            )
             is_causal = False
 
         y = F.scaled_dot_product_attention(
@@ -241,7 +246,7 @@ class Model5555LM(nn.Module):
         elif isinstance(module, RMSNorm):
             nn.init.ones_(module.weight)
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
         if not isinstance(input_ids, torch.Tensor):
             raise TypeError("input_ids must be a torch.Tensor")
         if input_ids.ndim != 2:
@@ -260,12 +265,26 @@ class Model5555LM(nn.Module):
                 raise ValueError("attention_mask must have the same shape as input_ids")
             if attention_mask.device != input_ids.device:
                 raise ValueError("attention_mask and input_ids must be on the same device")
+            if attention_mask.dtype == torch.bool:
+                attention_mask = attention_mask.to(torch.bool)
+            elif attention_mask.is_floating_point() or attention_mask.dtype in (
+                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
+            ):
+                attention_mask = attention_mask != 0
+            else:
+                raise TypeError("attention_mask must be boolean or numeric")
         if input_ids.min() < 0 or input_ids.max() >= self.config.vocab_size:
             raise ValueError(f"input_ids contains a token outside [0, {self.config.vocab_size})")
         x = self.embed_dropout(self.embed_tokens(input_ids))
+        hidden_states = [] if output_hidden_states else None
         for layer in self.layers:
             x = layer(x, attention_mask)
-        return self.lm_head(self.final_layernorm(x))
+            if output_hidden_states:
+                hidden_states.append(x)
+        logits = self.lm_head(self.final_layernorm(x))
+        if output_hidden_states:
+            return logits, hidden_states
+        return logits
 
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
