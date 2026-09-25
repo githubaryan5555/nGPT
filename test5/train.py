@@ -93,6 +93,26 @@ if master_process:
     print(f"device={device}, world_size={world_size}, dtype={dtype_name}")
     print(f"tokens per optimizer step={tokens_per_step:,}")
 
+# Loss shaping is configurable so you can turn each regularizer on/off without
+# changing the base CE implementation or model code.
+LOSS_TEMPERATURE = max(float(getattr(cfg, "loss_temperature", 1.0)), 1e-3)
+LABEL_SMOOTHING = min(max(float(getattr(cfg, "label_smoothing", 0.0)), 0.0), 1.0)
+FOCAL_GAMMA = max(float(getattr(cfg, "focal_gamma", 0.0)), 0.0)
+ENTROPY_REGULARIZATION = max(float(getattr(cfg, "entropy_regularization", 0.0)), 0.0)
+CONFIDENCE_PENALTY = max(float(getattr(cfg, "confidence_penalty", 0.0)), 0.0)
+TOKEN_DIFFICULTY_WEIGHTING = bool(getattr(cfg, "token_difficulty_weighting", False))
+TOKEN_DIFFICULTY_MIN = max(float(getattr(cfg, "token_difficulty_min", 0.5)), 0.0)
+TOKEN_DIFFICULTY_MAX = max(float(getattr(cfg, "token_difficulty_max", 2.0)), TOKEN_DIFFICULTY_MIN)
+TOKEN_LOSS_CLIP = max(float(getattr(cfg, "token_loss_clip", 0.0)), 0.0)
+
+if master_process:
+    print(
+        "loss: "
+        f"temperature={LOSS_TEMPERATURE:g}, label_smoothing={LABEL_SMOOTHING:g}, "
+        f"focal_gamma={FOCAL_GAMMA:g}, entropy_reg={ENTROPY_REGULARIZATION:g}, "
+        f"confidence_penalty={CONFIDENCE_PENALTY:g}, difficulty_weighting={TOKEN_DIFFICULTY_WEIGHTING}"
+    )
+
 torch.manual_seed(cfg.seed + rank)
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -204,7 +224,49 @@ raw_model = model.module if ddp else model
 
 
 def language_loss(logits, targets):
-    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+    """Token-normalized CE with optional smoothing, focal, entropy, and difficulty weighting."""
+    logits = logits / LOSS_TEMPERATURE
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_targets = targets.reshape(-1)
+
+    log_probs = F.log_softmax(flat_logits, dim=-1)
+    probs = torch.exp(log_probs)
+    target_log_probs = log_probs.gather(1, flat_targets.unsqueeze(1)).squeeze(1)
+    target_probs = probs.gather(1, flat_targets.unsqueeze(1)).squeeze(1)
+
+    # Standard cross-entropy with optional label smoothing.
+    if LABEL_SMOOTHING > 0.0:
+        smooth = -log_probs.mean(dim=-1)
+        loss = (1.0 - LABEL_SMOOTHING) * (-target_log_probs) + LABEL_SMOOTHING * smooth
+    else:
+        loss = -target_log_probs
+
+    # Focal weighting pushes emphasis toward hard examples.
+    if FOCAL_GAMMA > 0.0:
+        focal_factor = (1.0 - target_probs).clamp_min(1e-6).pow(FOCAL_GAMMA)
+        loss = loss * focal_factor
+
+    # Difficulty weighting: emphasize tokens with larger CE without altering gradient direction.
+    if TOKEN_DIFFICULTY_WEIGHTING:
+        with torch.no_grad():
+            difficulty = loss.detach()
+            difficulty = difficulty / difficulty.mean().clamp_min(1e-6)
+            difficulty = difficulty.clamp(TOKEN_DIFFICULTY_MIN, TOKEN_DIFFICULTY_MAX)
+            difficulty = difficulty / difficulty.mean().clamp_min(1e-6)
+        loss = loss * difficulty
+
+    # Regularizers
+    entropy = -(probs * log_probs).sum(dim=-1)
+    if ENTROPY_REGULARIZATION > 0.0:
+        loss = loss - ENTROPY_REGULARIZATION * entropy
+    if CONFIDENCE_PENALTY > 0.0:
+        confidence = -log_probs.max(dim=-1).values
+        loss = loss + CONFIDENCE_PENALTY * confidence
+
+    if TOKEN_LOSS_CLIP > 0.0:
+        loss = loss.clamp(max=TOKEN_LOSS_CLIP)
+
+    return loss.mean()
 
 
 @torch.no_grad()
