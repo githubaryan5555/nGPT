@@ -1,7 +1,7 @@
-"""Training entry point for Model5555LM.
+"""DDP-capable trainer for Model5555LM.
 
-The dataset is expected to already contain token ids; no tokenisation is performed
-here.  Paths and model/training defaults live in ``config.py``.
+The binary files are already tokenized. Configuration is loaded by config.py from
+config.json, while command-line ``--name=value`` arguments can override it.
 """
 
 import argparse
@@ -15,21 +15,20 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import destroy_process_group, init_process_group
 
 import config as cfg
 from model import Config, Model5555LM
 
 
-def _cli_overrides():
-    """Apply simple ``--name=value`` overrides without requiring configurator.py."""
-    aliases = {"compile": "compile_model", "decay_lr": "lr_decay"}
-    parser = argparse.ArgumentParser(add_help=True)
-    parser.add_argument("--resume", action="store_true", help="resume the newest checkpoint")
+def apply_cli():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--eval_only", action="store_true")
     args, unknown = parser.parse_known_args()
+    aliases = {"compile": "compile_model", "decay_lr": "lr_decay"}
     for item in unknown:
         if not item.startswith("--") or "=" not in item:
             continue
@@ -39,11 +38,13 @@ def _cli_overrides():
             continue
         old = getattr(cfg, name)
         if isinstance(old, bool):
-            value = value.lower() in ("1", "true", "yes", "y", "on")
+            value = value.lower() in {"1", "true", "yes", "on"}
         elif isinstance(old, int) and not isinstance(old, bool):
             value = int(value)
         elif isinstance(old, float):
             value = float(value)
+        elif value.lower() == "none":
+            value = None
         setattr(cfg, name, value)
     if args.resume:
         cfg.init_from = "resume"
@@ -51,270 +52,284 @@ def _cli_overrides():
         cfg.eval_only = True
 
 
-_cli_overrides()
-
-# Centralised config values, with backwards-compatible fallbacks for config.py files
-# that predate this trainer.
-model_name = getattr(cfg, "model_name", "model5555")
-dataset_dir = getattr(cfg, "dataset_dir", "dataset")
-train_bin = getattr(cfg, "train_bin", os.path.join(dataset_dir, "train.bin"))
-val_bin = getattr(cfg, "val_bin", os.path.join(dataset_dir, "val.bin"))
-dataset_dtype_name = getattr(cfg, "dataset_dtype", "uint16")
-max_seq_len = getattr(cfg, "max_seq_len", 256)
-out_dir = getattr(cfg, "out_dir", f"out_{model_name}")
-if out_dir == "checkpoints" and not hasattr(cfg, "model_name"):
-    out_dir = f"out_{model_name}"
-
-# Keep the requested convention: model-name_ckpt_step-number.pt.
-checkpoint_pattern = os.path.join(out_dir, f"{model_name}_ckpt_*.pt")
-
-try:
-    dataset_dtype = np.dtype(dataset_dtype_name)
-except TypeError as exc:
-    raise ValueError(f"Unsupported dataset_dtype: {dataset_dtype_name!r}") from exc
+apply_cli()
+model_name = cfg.model_name
+dataset_dtype = np.dtype(cfg.dataset_dtype)
 if dataset_dtype.kind not in "iu":
     raise ValueError("dataset_dtype must be an integer NumPy dtype")
 
-# DDP setup.
-ddp = int(os.environ.get("RANK", -1)) != -1
+# DDP is initialized before any device-dependent work.
+ddp = int(os.environ.get("RANK", -1)) >= 0
 if ddp:
-    init_process_group(backend=cfg.backend)
-    ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
-    ddp_world_size = int(os.environ["WORLD_SIZE"])
-    device = f"cuda:{ddp_local_rank}"
+    dist.init_process_group(backend=cfg.backend)
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{local_rank}"
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0
-    seed_offset = ddp_rank
-    if cfg.gradient_accumulation_steps % ddp_world_size:
-        raise ValueError("gradient_accumulation_steps must be divisible by DDP world size")
-    gradient_accumulation_steps = cfg.gradient_accumulation_steps // ddp_world_size
 else:
-    ddp_rank, ddp_world_size, seed_offset = 0, 1, 0
-    master_process = True
+    rank, local_rank, world_size = 0, 0, 1
     device = cfg.device
-    gradient_accumulation_steps = cfg.gradient_accumulation_steps
-
+master_process = rank == 0
 if "cuda" in device and not torch.cuda.is_available():
-    raise RuntimeError("config.device requests CUDA, but CUDA is not available")
+    raise RuntimeError("CUDA was requested but is unavailable")
 device_type = "cuda" if "cuda" in device else "cpu"
 if device_type == "cpu" and cfg.dtype != "float32":
-    print("CPU does not support the configured mixed precision reliably; using float32")
     dtype_name = "float32"
 else:
     dtype_name = cfg.dtype
-ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype_name]
-ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-use_scaler = device_type == "cuda" and dtype_name == "float16"
-scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+ptdtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
+ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type="cuda", dtype=ptdtype)
+scaler = torch.amp.GradScaler("cuda", enabled=device_type == "cuda" and dtype_name == "float16")
 
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * cfg.batch_size * max_seq_len
+if cfg.gradient_accumulation_steps % world_size:
+    raise ValueError("gradient_accumulation_steps must be divisible by world size")
+local_grad_accum = cfg.gradient_accumulation_steps // world_size
+max_seq_len = cfg.max_seq_len
+batch_size = cfg.batch_size
+tokens_per_step = cfg.gradient_accumulation_steps * batch_size * max_seq_len
 if master_process:
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"tokens per iteration: {tokens_per_iter:,}")
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    print(f"device={device}, world_size={world_size}, dtype={dtype_name}")
+    print(f"tokens per optimizer step={tokens_per_step:,}")
 
-torch.manual_seed(getattr(cfg, "seed", 1337) + seed_offset)
+torch.manual_seed(cfg.seed + rank)
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-for path in (train_bin, val_bin):
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Missing tokenized dataset file: {path}")
+# Keep each memmap open and use vectorized windows; this removes the old per-sample
+# Python slicing/astype loop, which was a significant input pipeline bottleneck.
+class TokenBatches:
+    def __init__(self):
+        self.maps = {}
+        for split, path in (("train", cfg.train_bin), ("val", cfg.val_bin)):
+            if not os.path.isfile(path):
+                raise FileNotFoundError(path)
+            data = np.memmap(path, dtype=dataset_dtype, mode="r")
+            if len(data) <= max_seq_len:
+                raise ValueError(f"{path} must contain more than max_seq_len tokens")
+            self.maps[split] = data
 
-# Memmaps are recreated per batch to avoid long-lived worker/memmap leaks.
-def get_batch(split):
-    path = train_bin if split == "train" else val_bin
-    data = np.memmap(path, dtype=dataset_dtype, mode="r")
-    if len(data) <= max_seq_len:
-        raise ValueError(f"{path} must contain more than max_seq_len tokens")
-    ix = torch.randint(len(data) - max_seq_len, (cfg.batch_size,))
-    x = torch.stack([torch.from_numpy(data[int(i):int(i) + max_seq_len].astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy(data[int(i) + 1:int(i) + 1 + max_seq_len].astype(np.int64)) for i in ix])
-    if device_type == "cuda":
-        return x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    return x.to(device), y.to(device)
-
-# Optional BPE tokenizer, used only for qualitative samples.
-tokenizer = None
-tokenizer_path = getattr(cfg, "tokenizer_path", "tokenizer/tokenizer.json")
-try:
-    from tokenizers import Tokenizer
-    if os.path.isfile(tokenizer_path):
-        tokenizer = Tokenizer.from_file(tokenizer_path)
-    elif master_process:
-        print(f"warning: tokenizer not found at {tokenizer_path}; sample generation disabled")
-except ImportError:
-    if master_process:
-        print("warning: install `tokenizers` to enable generated text samples")
-
-def decode_ids(ids):
-    try:
-        return tokenizer.decode([int(x) for x in ids], skip_special_tokens=True)
-    except TypeError:
-        return tokenizer.decode([int(x) for x in ids])
-
-def sample_text(raw_model, count=5):
-    if tokenizer is None:
-        return
-    print("generated samples:")
-    was_training = raw_model.training
-    raw_model.eval()
-    for sample_index in range(count):
-        source, _ = get_batch("val")
-        prompt_ids = source[0, :max(1, min(16, max_seq_len // 4))].detach().cpu()
-        prompt = decode_ids(prompt_ids)
-        try:
-            text = raw_model.generate(
-                prompt, tokenizer,
-                max_new_tokens=getattr(cfg, "sample_new_tokens", 80),
-                temperature=getattr(cfg, "sample_temperature", 0.8),
-                top_k=getattr(cfg, "sample_top_k", 50),
-                top_p=getattr(cfg, "sample_top_p", 0.95),
-                eos_token_id=getattr(cfg, "eos_token_id", None),
-            )
-            print(f"  [{sample_index + 1}] {text}")
-        except Exception as exc:
-            print(f"  [{sample_index + 1}] generation failed: {exc}")
-    raw_model.train(was_training)
-
-# Build the model using the names and defaults expected by model.py.
-def make_model(model_values=None):
-    values = {
-        "vocab_size": cfg.vocab_size,
-        "hidden_size": cfg.hidden_size,
-        "num_hidden_layers": cfg.num_hidden_layers,
-        "intermediate_size": cfg.intermediate_size,
-        "num_attention_heads": cfg.num_attention_heads,
-        "num_key_value_heads": cfg.num_key_value_heads,
-        "attention_dropout": cfg.attention_dropout,
-        "hidden_dropout": cfg.hidden_dropout,
-        "rms_norm_eps": cfg.rms_norm_eps,
-        "rope_theta": cfg.rope_theta,
-        "max_seq_len": max_seq_len,
-        "tie_word_embeddings": cfg.tie_word_embeddings,
-        "initializer_range": cfg.initializer_range,
-    }
-    if model_values:
-        values.update(model_values)
-    return Model5555LM(Config(**values))
+    def get(self, split):
+        data = self.maps[split]
+        starts = torch.randint(0, len(data) - max_seq_len, (batch_size,)).numpy()
+        offsets = np.arange(max_seq_len + 1, dtype=np.int64)
+        windows = np.asarray(data[starts[:, None] + offsets[None, :]], dtype=np.int64)
+        x = torch.from_numpy(windows[:, :-1].copy())
+        y = torch.from_numpy(windows[:, 1:].copy())
+        if device_type == "cuda":
+            x = x.pin_memory().to(device, non_blocking=True)
+            y = y.pin_memory().to(device, non_blocking=True)
+        else:
+            x, y = x.to(device), y.to(device)
+        return x, y
 
 
-def newest_checkpoint():
-    files = glob.glob(checkpoint_pattern)
-    if not files:
-        # Also accept a legacy checkpoint if one exists in the configured output dir.
-        legacy = os.path.join(out_dir, getattr(cfg, "checkpoint_name", "ckpt.pt"))
-        return legacy if os.path.isfile(legacy) else None
-    return max(files, key=lambda p: int(re.search(r"_(\d+)\.pt$", p).group(1)))
+batches = TokenBatches()
+
+
+def model_values():
+    return {name: getattr(cfg, name) for name in (
+        "vocab_size", "hidden_size", "num_hidden_layers", "intermediate_size",
+        "num_attention_heads", "num_key_value_heads", "attention_dropout",
+        "hidden_dropout", "rms_norm_eps", "rope_theta", "tie_word_embeddings",
+        "initializer_range") } | {"max_seq_len": max_seq_len}
+
+
+def make_model(values=None):
+    args = model_values()
+    if values:
+        args.update(values)
+    return Model5555LM(Config(**args))
+
+
+def checkpoint_files():
+    pattern = os.path.join(cfg.out_dir, f"{model_name}_ckpt_*.pt")
+    files = []
+    for path in glob.glob(pattern):
+        match = re.search(r"_(\d+)\.pt$", path)
+        if match:
+            files.append((int(match.group(1)), path))
+    files.sort()
+    return files
+
+
+def latest_checkpoint():
+    files = checkpoint_files()
+    if files:
+        return files[-1][1]
+    legacy = os.path.join(cfg.out_dir, cfg.checkpoint_name)
+    return legacy if os.path.isfile(legacy) else None
+
 
 iter_num = 0
 best_val_loss = float("inf")
 checkpoint = None
-if getattr(cfg, "init_from", "scratch") == "resume":
-    ckpt_path = newest_checkpoint()
-    if ckpt_path is None:
-        raise FileNotFoundError(f"No checkpoint found in {out_dir} matching {checkpoint_pattern}")
-    print(f"resuming from {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model = make_model(checkpoint.get("model_args") or checkpoint.get("model_config"))
-    state = checkpoint["model"]
-    state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+if cfg.init_from == "resume":
+    path = latest_checkpoint()
+    if path is None:
+        raise FileNotFoundError(f"No checkpoint found in {cfg.out_dir}")
+    if master_process:
+        print(f"resuming from {path}")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    model = make_model(checkpoint.get("model_args"))
+    state = {key.removeprefix("_orig_mod."): value for key, value in checkpoint["model"].items()}
     model.load_state_dict(state)
     iter_num = int(checkpoint.get("iter_num", checkpoint.get("step", 0)))
     best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
 else:
-    print("initializing a new model from scratch")
     model = make_model()
 
 model.to(device)
-if master_process and getattr(cfg, "print_model_info", True):
-    print(f"parameters: {model.get_num_params():,}")
-    print(f"model size (fp16): {model.get_model_size_mb():.8g} MB")
+if master_process and cfg.print_model_info:
+    print(f"parameters={model.get_num_params():,}, fp16 size={model.get_model_size_mb():.8g} MB")
 
-# AdamW implementation kept in train.py because model.py is intentionally unchanged.
 decay, no_decay = [], []
-for param in model.parameters():
-    if param.requires_grad:
-        (decay if param.ndim >= 2 else no_decay).append(param)
+for parameter in model.parameters():
+    if parameter.requires_grad:
+        (decay if parameter.ndim >= 2 else no_decay).append(parameter)
+fused = device_type == "cuda" and "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
 optimizer = torch.optim.AdamW(
     [{"params": decay, "weight_decay": cfg.weight_decay}, {"params": no_decay, "weight_decay": 0.0}],
-    lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2),
-    fused=(device_type == "cuda" and "fused" in torch.optim.AdamW.__init__.__code__.co_varnames),
-)
+    lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), fused=fused)
 if checkpoint is not None and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 
-if getattr(cfg, "compile_model", False):
-    print("compiling the model...")
+if cfg.compile_model:
     model = torch.compile(model)
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model = DDP(model, device_ids=[local_rank])
 raw_model = model.module if ddp else model
+
+
+def language_loss(logits, targets):
+    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+
 
 @torch.no_grad()
 def estimate_loss():
+    """Every rank evaluates, then all ranks receive the same global averages."""
     model.eval()
-    result = {}
-    for split in ("train", "val"):
-        losses = []
+    totals = torch.zeros(2, device=device, dtype=torch.float64)
+    for index, split in enumerate(("train", "val")):
         for _ in range(cfg.eval_iters):
-            x, y = get_batch(split)
+            x, y = batches.get(split)
             with ctx:
-                logits = model(x)
-                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-            losses.append(loss.item())
-        result[split] = float(np.mean(losses))
+                value = language_loss(model(x), y)
+            totals[index] += value.detach().double()
+    if ddp:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    totals /= cfg.eval_iters * world_size
     model.train()
-    return result
+    return {"train": totals[0].item(), "val": totals[1].item()}
+
 
 def get_lr(step):
-    if not getattr(cfg, "lr_decay", True):
+    if not cfg.lr_decay:
         return cfg.learning_rate
     if step < cfg.warmup_iters:
         return cfg.learning_rate * (step + 1) / (cfg.warmup_iters + 1)
     if step >= cfg.lr_decay_iters:
         return cfg.min_lr
     ratio = (step - cfg.warmup_iters) / (cfg.lr_decay_iters - cfg.warmup_iters)
-    return cfg.min_lr + 0.5 * (1 + math.cos(math.pi * ratio)) * (cfg.learning_rate - cfg.min_lr)
+    return cfg.min_lr + 0.5 * (1.0 + math.cos(math.pi * ratio)) * (cfg.learning_rate - cfg.min_lr)
 
-X, Y = get_batch("train")
-t0 = time.time()
+
+# Optional tokenizer is used only for samples. The adapter supplies the interface
+# expected by Model5555LM.generate().
+tokenizer = None
+if os.path.isfile(cfg.tokenizer_path):
+    try:
+        from tokenizers import Tokenizer
+        backend_tokenizer = Tokenizer.from_file(cfg.tokenizer_path)
+        class TokenizerAdapter:
+            def encode(self, text):
+                return backend_tokenizer.encode(text).ids
+            def decode(self, ids):
+                return backend_tokenizer.decode(ids, skip_special_tokens=True)
+        tokenizer = TokenizerAdapter()
+    except (ImportError, Exception) as exc:
+        if master_process:
+            print(f"warning: tokenizer unavailable ({exc})")
+
+
+def sample_text():
+    if tokenizer is None or not master_process:
+        return
+    was_training = raw_model.training
+    raw_model.eval()
+    print("samples:")
+    for number in range(cfg.sample_count):
+        source, _ = batches.get("val")
+        prompt_ids = source[0, :min(cfg.sample_prompt_tokens, max_seq_len)].cpu().tolist()
+        prompt = tokenizer.decode(prompt_ids)
+        try:
+            output = raw_model.generate(prompt, tokenizer, max_new_tokens=cfg.sample_new_tokens,
+                                        temperature=cfg.sample_temperature, top_k=cfg.sample_top_k,
+                                        top_p=cfg.sample_top_p, eos_token_id=cfg.eos_token_id)
+            print(f"  [{number + 1}] {output}")
+        except Exception as exc:
+            print(f"  [{number + 1}] generation failed: {exc}")
+    raw_model.train(was_training)
+
+
+def save_checkpoint(step, val_loss):
+    if not master_process or not cfg.save_checkpoint:
+        return
+    payload = {"model": raw_model.state_dict(), "optimizer": optimizer.state_dict(),
+               "model_args": raw_model.get_config(), "iter_num": step,
+               "best_val_loss": val_loss, "config": cfg.as_dict(),
+               "rng_state": torch.get_rng_state()}
+    path = os.path.join(cfg.out_dir, f"{model_name}_ckpt_{step}.pt")
+    temporary = path + f".tmp.{os.getpid()}"
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+    # A stable pointer makes external resume tooling simple while numbered files
+    # remain available for rollback.
+    latest = os.path.join(cfg.out_dir, f"{model_name}_latest.pt")
+    latest_tmp = latest + f".tmp.{os.getpid()}"
+    torch.save(payload, latest_tmp)
+    os.replace(latest_tmp, latest)
+    print(f"saved checkpoint: {path}")
+
+
+X, Y = batches.get("train")
+last_time = time.perf_counter()
+local_step = 0
 running_mfu = None
-local_iter_num = 0
-while True:
+while iter_num < cfg.max_iters:
     lr = get_lr(iter_num)
     for group in optimizer.param_groups:
         group["lr"] = lr
 
-    if iter_num % cfg.eval_interval == 0 and master_process:
+    if iter_num % cfg.eval_interval == 0:
+        # This collective must be called by every rank. Only rank zero prints/saves.
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.16g}, val loss {losses['val']:.16g}, lr {lr:.16g}")
-        sample_text(raw_model, 5)
-        should_save = getattr(cfg, "save_checkpoint", True) and (losses["val"] < best_val_loss or getattr(cfg, "always_save_checkpoint", False))
-        if losses["val"] < best_val_loss:
-            best_val_loss = losses["val"]
-        if should_save and iter_num > 0:
-            ckpt = {
-                "model": raw_model.state_dict(), "optimizer": optimizer.state_dict(),
-                "model_args": raw_model.get_config(), "iter_num": iter_num,
-                "best_val_loss": best_val_loss,
-                "config": {k: v for k, v in vars(cfg).items() if not k.startswith("_")},
-            }
-            path = os.path.join(out_dir, f"{model_name}_ckpt_{iter_num}.pt")
-            torch.save(ckpt, path)
-            print(f"saved checkpoint: {path}")
+        if master_process:
+            print(f"step={iter_num:06d} train_loss={losses['train']:.16g} "
+                  f"val_loss={losses['val']:.16g} lr={lr:.16g}")
+            sample_text()
+            improved = losses["val"] < best_val_loss
+            if improved:
+                best_val_loss = losses["val"]
+            if iter_num > 0 and (improved or cfg.always_save_checkpoint):
+                save_checkpoint(iter_num, best_val_loss)
+        if ddp:
+            dist.barrier()
     if iter_num == 0 and cfg.eval_only:
         break
 
-    for micro_step in range(gradient_accumulation_steps):
+    step_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    for micro_step in range(local_grad_accum):
         if ddp:
-            model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
+            model.require_backward_grad_sync = micro_step == local_grad_accum - 1
         with ctx:
             logits = model(X)
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), Y.reshape(-1))
-            loss = loss / gradient_accumulation_steps
-        X, Y = get_batch("train")
+            micro_loss = language_loss(logits, Y)
+            loss = micro_loss / local_grad_accum
+        step_loss_sum += micro_loss.detach().double()
+        X, Y = batches.get("train")
         scaler.scale(loss).backward()
     if cfg.grad_clip:
         scaler.unscale_(optimizer)
@@ -323,22 +338,29 @@ while True:
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
 
-    now = time.time()
-    dt = now - t0
-    t0 = now
+    if ddp:
+        dist.all_reduce(step_loss_sum, op=dist.ReduceOp.SUM)
+    average_step_loss = (step_loss_sum / (local_grad_accum * world_size)).item()
+    now = time.perf_counter()
+    elapsed = now - last_time
+    last_time = now
     if iter_num % cfg.log_interval == 0 and master_process:
-        lossf = loss.item() * gradient_accumulation_steps
-        mfu_text = "n/a"
-        if getattr(cfg, "peak_flops", None) and local_iter_num >= 5:
-            tok_s = tokens_per_iter / max(dt, 1e-9)
-            mfu = raw_model.estimate_mfu(tok_s, cfg.peak_flops)
+        tokens_per_second = tokens_per_step / max(elapsed, 1e-9)
+        flops_per_token = raw_model.get_flops_per_token(max_seq_len)
+        flops_per_second = tokens_per_second * flops_per_token
+        mfu = None
+        if cfg.peak_flops:
+            mfu = raw_model.estimate_mfu(tokens_per_second, cfg.peak_flops)
             running_mfu = mfu if running_mfu is None else 0.9 * running_mfu + 0.1 * mfu
-            mfu_text = f"{running_mfu:.8g}%"
-        print(f"iter {iter_num}: loss {lossf:.16g}, time {dt * 1000:.8g}ms, mfu {mfu_text}")
+        mfu_text = "n/a" if running_mfu is None else f"{running_mfu:.8g}%"
+        print(f"iter={iter_num:06d} loss={average_step_loss:.16g} "
+              f"time={elapsed:.8g}s tokens/s={tokens_per_second:.8g} "
+              f"FLOP/token={flops_per_token:.8g} FLOP/s={flops_per_second:.8g} MFU={mfu_text}")
     iter_num += 1
-    local_iter_num += 1
-    if iter_num > cfg.max_iters:
-        break
+    local_step += 1
 
+# max_iters is an exclusive update count: max_iters=1000 performs steps 0..999.
+if master_process and cfg.save_checkpoint and iter_num > 0:
+    save_checkpoint(iter_num, best_val_loss)
 if ddp:
-    destroy_process_group()
+    dist.destroy_process_group()
