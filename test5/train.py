@@ -103,6 +103,10 @@ if torch.cuda.is_available():
 class TokenBatches:
     def __init__(self):
         self.maps = {}
+        # Generate indices directly with NumPy. The previous torch.randint(...).numpy()
+        # moved every batch's indices through the CPU Torch-to-NumPy conversion.
+        self.rng = np.random.default_rng(cfg.seed + rank)
+        self.offsets = np.arange(max_seq_len + 1, dtype=np.int64)
         for split, path in (("train", cfg.train_bin), ("val", cfg.val_bin)):
             if not os.path.isfile(path):
                 raise FileNotFoundError(path)
@@ -113,9 +117,8 @@ class TokenBatches:
 
     def get(self, split):
         data = self.maps[split]
-        starts = torch.randint(0, len(data) - max_seq_len, (batch_size,)).numpy()
-        offsets = np.arange(max_seq_len + 1, dtype=np.int64)
-        windows = np.asarray(data[starts[:, None] + offsets[None, :]], dtype=np.int64)
+        starts = self.rng.integers(0, len(data) - max_seq_len, size=batch_size, dtype=np.int64)
+        windows = np.asarray(data[starts[:, None] + self.offsets[None, :]], dtype=np.int64)
         x = torch.from_numpy(windows[:, :-1].copy())
         y = torch.from_numpy(windows[:, 1:].copy())
         if device_type == "cuda":
@@ -211,13 +214,13 @@ def language_loss(logits, targets):
 def estimate_loss():
     """Every rank evaluates, then all ranks receive the same global averages."""
     model.eval()
-    totals = torch.zeros(2, device=device, dtype=torch.float64)
+    totals = torch.zeros(2, device=device, dtype=torch.float32)
     for index, split in enumerate(("train", "val")):
         for _ in range(cfg.eval_iters):
             x, y = batches.get(split)
             with ctx:
                 value = language_loss(model(x), y)
-            totals[index] += value.detach().double()
+            totals[index] += value.detach().float()
     if ddp:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
     totals /= cfg.eval_iters * world_size
@@ -296,7 +299,6 @@ def save_checkpoint(step, val_loss):
 
 X, Y = batches.get("train")
 last_time = time.perf_counter()
-local_step = 0
 running_mfu = None
 while iter_num < cfg.max_iters:
     lr = get_lr(iter_num)
@@ -320,7 +322,9 @@ while iter_num < cfg.max_iters:
     if iter_num == 0 and cfg.eval_only:
         break
 
-    step_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    # Loss logging only needs fp32. Keeping this accumulator in fp64 added an
+    # unnecessary conversion and made the per-micro-step hot path more expensive.
+    step_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
     for micro_step in range(local_grad_accum):
         if ddp:
             model.require_backward_grad_sync = micro_step == local_grad_accum - 1
@@ -328,9 +332,12 @@ while iter_num < cfg.max_iters:
             logits = model(X)
             micro_loss = language_loss(logits, Y)
             loss = micro_loss / local_grad_accum
-        step_loss_sum += micro_loss.detach().double()
-        X, Y = batches.get("train")
+        step_loss_sum += micro_loss.detach().float()
         scaler.scale(loss).backward()
+        # Fetch after backward, rather than between forward and backward. This
+        # keeps the forward/backward pair contiguous and lets CPU preparation and
+        # non-blocking H2D copies overlap the next backward pass.
+        X, Y = batches.get("train")
     if cfg.grad_clip:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -357,7 +364,6 @@ while iter_num < cfg.max_iters:
               f"time={elapsed:.8g}s tokens/s={tokens_per_second:.8g} "
               f"FLOP/token={flops_per_token:.8g} FLOP/s={flops_per_second:.8g} MFU={mfu_text}")
     iter_num += 1
-    local_step += 1
 
 # max_iters is an exclusive update count: max_iters=1000 performs steps 0..999.
 if master_process and cfg.save_checkpoint and iter_num > 0:
