@@ -58,7 +58,6 @@ dataset_dtype = np.dtype(cfg.dataset_dtype)
 if dataset_dtype.kind not in "iu":
     raise ValueError("dataset_dtype must be an integer NumPy dtype")
 
-# DDP is initialized before any device-dependent work.
 ddp = int(os.environ.get("RANK", -1)) >= 0
 if ddp:
     dist.init_process_group(backend=cfg.backend)
@@ -74,10 +73,7 @@ master_process = rank == 0
 if "cuda" in device and not torch.cuda.is_available():
     raise RuntimeError("CUDA was requested but is unavailable")
 device_type = "cuda" if "cuda" in device else "cpu"
-if device_type == "cpu" and cfg.dtype != "float32":
-    dtype_name = "float32"
-else:
-    dtype_name = cfg.dtype
+dtype_name = "float32" if device_type == "cpu" else cfg.dtype
 ptdtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
 ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type="cuda", dtype=ptdtype)
 scaler = torch.amp.GradScaler("cuda", enabled=device_type == "cuda" and dtype_name == "float16")
@@ -93,8 +89,6 @@ if master_process:
     print(f"device={device}, world_size={world_size}, dtype={dtype_name}")
     print(f"tokens per optimizer step={tokens_per_step:,}")
 
-# Loss shaping is configurable so you can turn each regularizer on/off without
-# changing the base CE implementation or model code.
 LOSS_TEMPERATURE = max(float(getattr(cfg, "loss_temperature", 1.0)), 1e-3)
 LABEL_SMOOTHING = min(max(float(getattr(cfg, "label_smoothing", 0.0)), 0.0), 1.0)
 FOCAL_GAMMA = max(float(getattr(cfg, "focal_gamma", 0.0)), 0.0)
@@ -118,8 +112,7 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-# Keep each memmap open and use vectorized windows; this removes the old per-sample
-# Python slicing/astype loop, which was a significant input pipeline bottleneck.
+
 class TokenBatches:
     def __init__(self):
         self.maps = {}
@@ -154,7 +147,7 @@ def model_values():
         "vocab_size", "hidden_size", "num_hidden_layers", "intermediate_size",
         "num_attention_heads", "num_key_value_heads", "attention_dropout",
         "hidden_dropout", "rms_norm_eps", "rope_theta", "tie_word_embeddings",
-        "initializer_range") } | {"max_seq_len": max_seq_len}
+        "initializer_range")} | {"max_seq_len": max_seq_len}
 
 
 def make_model(values=None):
@@ -224,29 +217,21 @@ raw_model = model.module if ddp else model
 
 
 def language_loss(logits, targets):
-    """Token-normalized CE with optional smoothing, focal, entropy, and difficulty weighting."""
-    logits = logits / LOSS_TEMPERATURE
-    flat_logits = logits.reshape(-1, logits.size(-1))
+    """Fast token-normalized loss; full-vocabulary softmax is used only for entropy."""
+    flat_logits = (logits.float() / LOSS_TEMPERATURE).reshape(-1, logits.size(-1))
     flat_targets = targets.reshape(-1)
 
-    log_probs = F.log_softmax(flat_logits, dim=-1)
-    probs = torch.exp(log_probs)
-    target_log_probs = log_probs.gather(1, flat_targets.unsqueeze(1)).squeeze(1)
-    target_probs = probs.gather(1, flat_targets.unsqueeze(1)).squeeze(1)
+    # F.cross_entropy uses a fused log-softmax/NLL path. This avoids materializing
+    # both [tokens, vocab] log_probs and probs for the common loss terms.
+    loss = F.cross_entropy(
+        flat_logits, flat_targets, reduction="none", label_smoothing=LABEL_SMOOTHING)
 
-    # Standard cross-entropy with optional label smoothing.
-    if LABEL_SMOOTHING > 0.0:
-        smooth = -log_probs.mean(dim=-1)
-        loss = (1.0 - LABEL_SMOOTHING) * (-target_log_probs) + LABEL_SMOOTHING * smooth
-    else:
-        loss = -target_log_probs
-
-    # Focal weighting pushes emphasis toward hard examples.
     if FOCAL_GAMMA > 0.0:
-        focal_factor = (1.0 - target_probs).clamp_min(1e-6).pow(FOCAL_GAMMA)
-        loss = loss * focal_factor
+        # The unsmoothed target CE gives p(target) without constructing softmax.
+        target_ce = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        target_prob = torch.exp(-target_ce.detach())
+        loss = loss * (1.0 - target_prob).clamp_min(1e-6).pow(FOCAL_GAMMA)
 
-    # Difficulty weighting: emphasize tokens with larger CE without altering gradient direction.
     if TOKEN_DIFFICULTY_WEIGHTING:
         with torch.no_grad():
             difficulty = loss.detach()
@@ -255,23 +240,25 @@ def language_loss(logits, targets):
             difficulty = difficulty / difficulty.mean().clamp_min(1e-6)
         loss = loss * difficulty
 
-    # Regularizers
-    entropy = -(probs * log_probs).sum(dim=-1)
-    if ENTROPY_REGULARIZATION > 0.0:
-        loss = loss - ENTROPY_REGULARIZATION * entropy
     if CONFIDENCE_PENALTY > 0.0:
-        confidence = -log_probs.max(dim=-1).values
-        loss = loss + CONFIDENCE_PENALTY * confidence
+        # -log(max softmax probability) = logsumexp(logits) - max(logits).
+        confidence_penalty = torch.logsumexp(flat_logits, dim=-1) - flat_logits.max(dim=-1).values
+        loss = loss + CONFIDENCE_PENALTY * confidence_penalty
+
+    if ENTROPY_REGULARIZATION > 0.0:
+        # This is intentionally conditional: entropy is the only term that needs
+        # the expensive full [tokens, vocab] probability tensor.
+        log_probs = F.log_softmax(flat_logits, dim=-1)
+        entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+        loss = loss - ENTROPY_REGULARIZATION * entropy
 
     if TOKEN_LOSS_CLIP > 0.0:
         loss = loss.clamp(max=TOKEN_LOSS_CLIP)
-
     return loss.mean()
 
 
 @torch.no_grad()
 def estimate_loss():
-    """Every rank evaluates, then all ranks receive the same global averages."""
     model.eval()
     totals = torch.zeros(2, device=device, dtype=torch.float64)
     for index, split in enumerate(("train", "val")):
@@ -305,11 +292,14 @@ if os.path.isfile(cfg.tokenizer_path):
     try:
         from tokenizers import Tokenizer
         backend_tokenizer = Tokenizer.from_file(cfg.tokenizer_path)
+
         class TokenizerAdapter:
             def encode(self, text):
                 return backend_tokenizer.encode(text).ids
+
             def decode(self, ids):
                 return backend_tokenizer.decode(ids, skip_special_tokens=True)
+
         tokenizer = TokenizerAdapter()
     except (ImportError, Exception) as exc:
         if master_process:
@@ -347,8 +337,6 @@ def save_checkpoint(step, val_loss):
     temporary = path + f".tmp.{os.getpid()}"
     torch.save(payload, temporary)
     os.replace(temporary, path)
-    # A stable pointer makes external resume tooling simple while numbered files
-    # remain available for rollback.
     latest = os.path.join(cfg.out_dir, f"{model_name}_latest.pt")
     latest_tmp = latest + f".tmp.{os.getpid()}"
     torch.save(payload, latest_tmp)
@@ -366,7 +354,6 @@ while iter_num < cfg.max_iters:
         group["lr"] = lr
 
     if iter_num % cfg.eval_interval == 0:
-        # This collective must be called by every rank. Only rank zero prints/saves.
         losses = estimate_loss()
         if master_process:
             print(f"step={iter_num:06d} train_loss={losses['train']:.16g} "
@@ -421,7 +408,6 @@ while iter_num < cfg.max_iters:
     iter_num += 1
     local_step += 1
 
-# max_iters is an exclusive update count: max_iters=1000 performs steps 0..999.
 if master_process and cfg.save_checkpoint and iter_num > 0:
     save_checkpoint(iter_num, best_val_loss)
 if ddp:
