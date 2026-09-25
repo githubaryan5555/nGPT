@@ -52,14 +52,5 @@
   "sample_temperature": 0.8,
   "sample_top_k": 50,
   "sample_top_p": 0.95,
-  "eos_token_id": null,
-  "label_smoothing": 0.1,
-  "focal_gamma": 2.0,
-  "entropy_regularization": 0.0,#too expensiv
-  "confidence_penalty": 0.001,
-  "loss_temperature": 1.1,
-  "token_difficulty_weighting": true,
-  "token_difficulty_min": 0.5,
-  "token_difficulty_max": 2.0,
-  "token_loss_clip": 10.0
+  "eos_token_id": null
 }
