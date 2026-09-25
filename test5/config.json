@@ -55,7 +55,7 @@
   "eos_token_id": null,
   "label_smoothing": 0.1,
   "focal_gamma": 2.0,
-  "entropy_regularization": 0.001,
+  "entropy_regularization": 0.0,
   "confidence_penalty": 0.001,
   "loss_temperature": 1.1,
   "token_difficulty_weighting": true,
