@@ -1,0 +1,101 @@
+baseline no inproved ce
+
+ Cloning into 'nGPT'...
+remote: Enumerating objects: 1184, done.
+remote: Counting objects: 100% (190/190), done.
+remote: Compressing objects: 100% (93/93), done.
+remote: Total 1184 (delta 141), reused 91 (delta 91), pack-reused 994 (from 3)
+Receiving objects: 100% (1184/1184), 8.31 MiB | 13.55 MiB/s, done.
+Resolving deltas: 100% (619/619), done.
+/content/nGPT/test5
+device=cuda, world_size=1, dtype=float16
+tokens per optimizer step=524,288
+parameters=20,455,680, fp16 size=39.016113 MB
+W0925 08:02:02.586000 1602 torch/_inductor/utils.py:1731] [2/0] Not enough SMs to use max_autotune_gemm mode
+step=000000 train_loss=9.046436557769775 val_loss=9.046816482543946 lr=9.900990099009901e-06
+samples:
+  [1] e on bass, and Kenny Clarke on drums. All AllpenvanHD spe heads princip heads knewconomconom Earth text entering Againrancerete awards reseViewView Again Again nothing{ really ext lik favor United pie beenBecause camera Im Ir materroadThey beenBecause signeduries{ Notinois democrerror Not within Arab attempt Arab Arabvan plastic Staff Openroadstandingstandingureau allows slowly Did performance performanceroad resp decl spl headsual loud attempt Minister spepecial
+  [2]  few years away from production. We suppose that’s OK though, as variety 04 graduate historic causes causeswr soft causes historic moved moved clevel'm ending endingtt Champions London attacks attacks husband instrument Arch Arch Arch families founded prepar c physical someone3333irtyirtyManeesManMan extendj bu publication sacr prepar charges14 These These These Tri historicapp prethibry Main Londonazine Sar foundedhib Repeesip returned Sar exercise meal sacr sacr social socialuries Training Training publication heat
+  [3]  I know what a “normal” 31 year old woman should feel like Lady taking defe bag organization rainaidlements encourageyle patients patients paying encourage Q Thesetainingmpmpides lightingyleution aut rain rain programmingelly indic considFrFr Dave Lady am eval eval eval growoured culture2525ollywood Still build duty duty25 eval25 lighting Monday Mondayste Design ever LadyIL25ollywood� usually considgy those Only�fect phil phil LadyFCvas accountgy calls beforeuting patients
+  [4]  it is more an evolutionary update. The A2100 IS features Can partnership (" According According According according Over auto methodosh destroy�ulturalulturalboksbacks prepare previousmet Red mole cockmet cockboksmet chair tox windows appropri lot hands already already se PrespecialThanks creating auto addingacesacesacespecial fact actionsidersoftsoftaiboks printed printed Bow Redtainingoshinson writepecialmetmet Briganinsonboks pureennisFrurb soft  executive expectations become Works� mo feedback
+  [5] ees and the University of Florida College of Law Center Association Board of Trustees Order meant missed appreciate In somewhere occasrationrationss mixture mixtureades Support Eachmary Vis Vis targetlege NOT starting homesorg wakelection��Also NOT Gro county countyolution electronicAlso ownerwrit Sooking meantoking beginning beginning daily color having� 6 Bur middle unf mixture exhibition suggested feels supportsssaughtgogogoYanksgoYY architecture originalAlsoerve UtODOrig NOT next Support hitting 60 lighting lighting
+iter=000000 loss=9.046600162982941 time=99.413991s tokens/s=5273.7849 FLOP/token=42991616 FLOP/s=2.2672853e+11 MFU=n/a
+iter=000010 loss=8.575036108493805 time=7.3618393s tokens/s=71216.985 FLOP/token=42991616 FLOP/s=3.0617333e+12 MFU=n/a
+iter=000020 loss=8.170504570007324 time=7.2898876s tokens/s=71919.902 FLOP/token=42991616 FLOP/s=3.0919528e+12 MFU=n/a
+iter=000030 loss=7.669839322566986 time=7.1782182s tokens/s=73038.739 FLOP/token=42991616 FLOP/s=3.1400534e+12 MFU=n/a
+iter=000040 loss=7.181531250476837 time=7.1788237s tokens/s=73032.578 FLOP/token=42991616 FLOP/s=3.1397885e+12 MFU=n/a
+iter=000050 loss=6.781253784894943 time=7.1955832s tokens/s=72862.475 FLOP/token=42991616 FLOP/s=3.1324756e+12 MFU=n/a
+iter=000060 loss=6.498479425907135 time=7.2435224s tokens/s=72380.255 FLOP/token=42991616 FLOP/s=3.1117441e+12 MFU=n/a
+iter=000070 loss=6.273140430450439 time=7.2819869s tokens/s=71997.932 FLOP/token=42991616 FLOP/s=3.0953074e+12 MFU=n/a
+iter=000080 loss=6.096920847892761 time=7.3122916s tokens/s=71699.548 FLOP/token=42991616 FLOP/s=3.0824794e+12 MFU=n/a
+iter=000090 loss=5.895660102367401 time=7.2430118s tokens/s=72385.358 FLOP/token=42991616 FLOP/s=3.1119635e+12 MFU=n/a
+step=000100 train_loss=5.702933416366577 val_loss=5.810300197601318 lr=0.001
+samples:
+  [1] onomic variables. Includes real-time features such as renminatter and the following the Pal, I'm not a lot of the day of the following the Bovers, and he was the time, but I was in our head and and I was a great of some day. I can be the people, it may not for a high-mading. I had the time I just do. I'm going to the new, and
+  [2]  through your oil filter to exacerbate wear on your engine are in a good life.
+He was a bit of the "He has a good more information on your team, and one of the year.
+You can go to the same and to his cow and the most of the last year.
+The Echhr to make the same way you have to my new new system. I could not come to be the first time.
+This
+  [3] iscape DU-owned homes.
+DU's first farmer's not. I'll help your mind that, I could be a great, there and the day he could only to get him.
+Ni’s a part of that I've got a few-tic on them to create a lot of the poming from their site. And he is my favorite with a bit or the last year to learn to our own.
+It’s
+  [4]  tied to a particular instance of Windows Server, and you have to acquit to be a few times and do.
+The country is to the right that I don’ve come out to the book, but we’t be more to be on. If you should give them, you will be an not, and I will a big years with them.
+The DE:
+- Tasa and I have been a long-time, I was the
+  [5]  even intends it to be a shocking reveal.) Namely, and the other more, and the right, he was in that was in the fass of their favorite?
+Lackers will not be a few minutes of the following the Nace as a couple of the most of the way, in his bicking in the Puttery.
+“Homly, "facious, but that the Sit will only more of
+saved checkpoint: out_model5555/model5555_ckpt_100.pt
+iter=000100 loss=5.700197994709015 time=38.114829s tokens/s=13755.486 FLOP/token=42991616 FLOP/s=5.9137057e+11 MFU=n/a
+iter=000110 loss=5.539523839950562 time=7.0389133s tokens/s=74484.225 FLOP/token=42991616 FLOP/s=3.2021972e+12 MFU=n/a
+iter=000120 loss=5.40945839881897 time=7.2305572s tokens/s=72510.041 FLOP/token=42991616 FLOP/s=3.1173238e+12 MFU=n/a
+---------------------------------------------------------------------------
+KeyboardInterrupt                         Traceback (most recent call last)
+/tmp/ipykernel_1534/966521424.py in <cell line: 0>()
+      1 get_ipython().system('git clone https://github.com/githubaryan5555/nGPT.git')
+      2 get_ipython().run_line_magic('cd', 'nGPT/test5')
+----> 3 get_ipython().system('python train.py')
+
+4 frames/usr/local/lib/python3.13/dist-packages/google/colab/_shell.py in system(self, *args, **kwargs)
+     94       kwargs.update({'also_return_output': True})
+     95 
+---> 96     output = _system_commands._system_compat(self, *args, **kwargs)  # pylint:disable=protected-access
+     97 
+     98     if pip_warn:
+
+/usr/local/lib/python3.13/dist-packages/google/colab/_system_commands.py in _system_compat(shell, cmd, also_return_output)
+    452   # is expected to call this function, thus adding one level of nesting to the
+    453   # stack.
+--> 454   result = _run_command(
+    455       shell.var_expand(cmd, depth=2), clear_streamed_output=False
+    456   )
+
+/usr/local/lib/python3.13/dist-packages/google/colab/_system_commands.py in _run_command(cmd, clear_streamed_output)
+    202       os.close(child_pty)
+    203 
+--> 204       return _monitor_process(parent_pty, epoll, p, cmd, update_stdin_widget)
+    205   finally:
+    206     epoll.close()
+
+/usr/local/lib/python3.13/dist-packages/google/colab/_system_commands.py in _monitor_process(parent_pty, epoll, p, cmd, update_stdin_widget)
+    232   while True:
+    233     try:
+--> 234       result = _poll_process(parent_pty, epoll, p, cmd, decoder, state)
+    235       if result is not None:
+    236         return result
+
+/usr/local/lib/python3.13/dist-packages/google/colab/_system_commands.py in _poll_process(parent_pty, epoll, p, cmd, decoder, state)
+    280   output_available = False
+    281 
+--> 282   events = epoll.poll()
+    283   input_events = []
+    284   for _, event in events:
+
+KeyboardInterrupt: 
+
+
+
+Improved ce 
