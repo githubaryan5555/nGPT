@@ -1,1 +1,86 @@
 10/15gb vram
+Cloning into 'nGPT'...
+remote: Enumerating objects: 1256, done.
+remote: Counting objects: 100% (197/197), done.
+remote: Compressing objects: 100% (45/45), done.
+remote: Total 1256 (delta 174), reused 149 (delta 149), pack-reused 1059 (from 3)
+Receiving objects: 100% (1256/1256), 8.33 MiB | 12.79 MiB/s, done.
+Resolving deltas: 100% (662/662), done.
+/content/nGPT/test4
+device=cuda, world_size=1, dtype=float16
+tokens per optimizer step=524,288
+parameters=17,309,952, fp16 size=33.016113 MB
+W0926 10:26:11.700000 3418 torch/_inductor/utils.py:1731] [2/0] Not enough SMs to use max_autotune_gemm mode
+step=000000 train_loss=9.062120361328125 val_loss=9.061856060028076 lr=9.900990099009901e-06
+samples:
+  [1] m wide, apex acute. Anthers 1.3–2IPIP inspired fun_ gallonym Paccons chain chain chaincons Little favour posting posting discussed Muslim 30 conduct videoultyitelyible ends Salonym inspired note physical handling inspired if Frankville longer advice bikelphenticilly trib Economincluding London Set skill agent Frank� lines weather gave lotalled favour inspiredresres dutylpultyitageitage immigricago Fin leg except except exceptavor Muslim est York est cru birdanger
+  [2]  Oceanographic Institute, Treasure Coast Food Bank, Big Brothers Big S mom healthitness proposason mom Nstan hyit atmosp propos Nrey crisisnot atmosp cheese diversethertherther human enc enctingiciansboywidearksarks cells crisis become becomether offer partitrep partner partner Our tim remark webther fold Greg cheese constit deliveredald remark agents plentyulturalwhich tim Realomic offer cheese cheese screenastsenty�gaweightboygn nation nationulturalentyprirep enable
+  [3]  three aircraft of three F-4Ds escorting an AC- ViewSe advis monitor monitor cur Carol explan away away productionkes Leagueidelines problemsged invent...] supportarsh monitorcc answered neckretFollowFollow options Techn TechnSt stores Dave compan...] procedures procedures procedures kicklookous payment shallifiesuff And procedures Inte regularlyocrocr shallAmericdada production production monitor shall prohib prohib prohib partners shall Dave shallifies adopovedovedlimlim explan turningHearsh percent Stevenents cold
+  [4] –3.1 mm. Achenes ovate or orb finished IN Western shown shown couldctions evallynballosophvers governishes injroke Br MAundayosoph ways Sam timaintski��� IN weaponsgage via counsel��ctions IN Brgrgrgr stopysis Life eyesotic� ins serve talkshouseection Developmentbsyundaygrimp��lementslements advantage advantage advantageroke serve� village� reason ult Aud sideresents�ploygr
+  [5] , the Stryker bed sets off an audible alarm. Additionallyally merch 2011arters 30 Avenuewr merch merch introdu_lligsp merch deg pretty hotel Avenueasters error�_ introdu introduduct Avenue merchduct Joe Log Creek che bloodductlow Muslim importunder uncertainartersartersib incredicago updatedarterslowlow honestspsoft registration Land discip Creek showing_ score import posting error error combined tips exercisespsp ann import import temporary Muslim import yeslow proof Businessablyanny Business
+iter=000000 loss=9.063591063022614 time=94.52832s tokens/s=5546.359 FLOP/token=36700160 FLOP/s=2.0355226e+11 MFU=n/a
+iter=000010 loss=8.605025827884674 time=6.3046434s tokens/s=83159.026 FLOP/token=36700160 FLOP/s=3.0519496e+12 MFU=n/a
+iter=000020 loss=8.192847788333893 time=6.318053s tokens/s=82982.526 FLOP/token=36700160 FLOP/s=3.045472e+12 MFU=n/a
+iter=000030 loss=7.700269639492035 time=6.4689207s tokens/s=81047.214 FLOP/token=36700160 FLOP/s=2.9744457e+12 MFU=n/a
+iter=000040 loss=7.223228842020035 time=6.5658936s tokens/s=79850.212 FLOP/token=36700160 FLOP/s=2.9305156e+12 MFU=n/a
+iter=000050 loss=6.863179594278336 time=6.5417495s tokens/s=80144.921 FLOP/token=36700160 FLOP/s=2.9413314e+12 MFU=n/a
+iter=000060 loss=6.575075626373291 time=6.5301662s tokens/s=80287.084 FLOP/token=36700160 FLOP/s=2.9465488e+12 MFU=n/a
+iter=000070 loss=6.335354030132294 time=6.5827533s tokens/s=79645.7 FLOP/token=36700160 FLOP/s=2.92301e+12 MFU=n/a
+iter=000080 loss=6.149563729763031 time=6.6540429s tokens/s=78792.399 FLOP/token=36700160 FLOP/s=2.8916936e+12 MFU=n/a
+iter=000090 loss=5.975056409835815 time=6.5470062s tokens/s=80080.571 FLOP/token=36700160 FLOP/s=2.9389698e+12 MFU=n/a
+step=000100 train_loss=5.782535924911499 val_loss=5.889096021652222 lr=0.001
+samples:
+  [1] ion within us. First we were excited. Then we were really excited. After that’s a lot of the world, I think of a lot of the life of the following the publicing, I am going to the time, but I can't’t take a pake with a new cagel to the mind. He said it has made it at us, she has been a number of the time. I had been an unsted. And, I
+  [2]  is down—in some cases drastically,” he said. “It is a bit of the first time or so I have to see, and an an other of the best thing that she had one time.
+The country’s going to the same year.
+Mat and the most of the last year, the CT's right, I have the only very much time to make a couple of the other other thing, and you want to have a lot of
+  [3]  Revolutionary and Opposition Forces.
+Dr. Ron Pundo. C. L.
+- Somi Aa, S. A-54. L.
+Sez I have the GDINCA-date:
+- Sixin: AT
+It is a p. "The RBNS)
+- Apr W. The D. Till in the Kelel.
+A.
+  [4]  the country beginning in July are the worst on record and continue to wreak haft.
+This post is a gacies on the right or a more people who have a little bit-sisfits to get to be more than my dus. In the world had a number of the way for the new business and a big-mant-dour-pressing-basa and the time.
+And a new family is looking for
+  [5]  High Density Brighter LED Strip packs up to 360s, and more, and the right for the time in in a great time. "Sumaton. FB. Willas, 2012, and the Badinth, a couple of the most of the way, in his bicking and the P. We do the U. For more than that "It's Mick, and the Sit will only more than
+saved checkpoint: out_model5555/model5555_ckpt_100.pt
+iter=000100 loss=5.774052530527115 time=30.087695s tokens/s=17425.33 FLOP/token=36700160 FLOP/s=6.3951239e+11 MFU=n/a
+iter=000110 loss=5.601029872894287 time=6.5165463s tokens/s=80454.887 FLOP/token=36700160 FLOP/s=2.9527072e+12 MFU=n/a
+iter=000120 loss=5.480792671442032 time=6.6686619s tokens/s=78619.67 FLOP/token=36700160 FLOP/s=2.8853545e+12 MFU=n/a
+iter=000130 loss=5.30972683429718 time=6.6828359s tokens/s=78452.921 FLOP/token=36700160 FLOP/s=2.8792348e+12 MFU=n/a
+iter=000140 loss=5.209336906671524 time=6.6189839s tokens/s=79209.741 FLOP/token=36700160 FLOP/s=2.9070102e+12 MFU=n/a
+iter=000150 loss=5.092834502458572 time=6.5665099s tokens/s=79842.719 FLOP/token=36700160 FLOP/s=2.9302405e+12 MFU=n/a
+iter=000160 loss=4.971592962741852 time=6.6391169s tokens/s=78969.538 FLOP/token=36700160 FLOP/s=2.8981947e+12 MFU=n/a
+iter=000170 loss=4.865875095129013 time=6.6261483s tokens/s=79124.097 FLOP/token=36700160 FLOP/s=2.903867e+12 MFU=n/a
+iter=000180 loss=4.775985449552536 time=6.6314033s tokens/s=79061.396 FLOP/token=36700160 FLOP/s=2.9015659e+12 MFU=n/a
+iter=000190 loss=4.660436004400253 time=6.6530855s tokens/s=78803.737 FLOP/token=36700160 FLOP/s=2.8921098e+12 MFU=n/a
+step=000200 train_loss=4.595421514511108 val_loss=4.940489206314087 lr=0.0009728616793536588
+samples:
+  [1]  s.r.l. con sede legale in Mosni. Kyle is the rest of the day, and we are very nice to the other, they are so hard to get there.
+Jay, there’s an adult of the line in the door!
+A lot of people like the tone, because of the world’s life’s in the time, it’s not the story that you’re going to take
+  [2]  has spent the last four years "fundamentally transforming" this country and not a problem.
+In a very small way, I'm going to see all that day, and have the most most obvious to my life, then then I think the next time I'd been going to go out. I think we'd like the person so much but I'm a lot more good.
+Want to see the whole processor!
+I'm looking at my first
+  [3] olton around 1998
+Favourite Everton Moment
+Education of the Cellar Disease, the New York Times of South America have been made by Cell-Hodc, with two years old, dadly dual-president, which is also a series of bruise.
+In the day, he was a piano member of the World War,, as he was a very good night of
+  [4]  [...]
+Herbo Flora Cucumber Cool Gelhot
+J. Cornelni, S.A. (2003), H. B.A. (Fun) L. H. S. G. (Mixed) (1992). It was the final thing that he was still in the city’s past decade, averted by the "Police: The American Chronicles is an an
+  [5] undable unless item is misrepresented. No refund will be given the "pair" point.
+Fourth, at least when the gap was in the past, they saw it that this was the same thing by the best and more in the way it was.
+"She was going to fight for his home. In the day I was here, there was a bit less than his way," Wolver said. "I would go down
+saved checkpoint: out_model5555/model5555_ckpt_200.pt
+iter=000200 loss=4.596471637487411 time=36.842131s tokens/s=14230.664 FLOP/token=36700160 FLOP/s=5.2226766e+11 MFU=n/a
+iter=000210 loss=4.517480462789536 time=6.3780491s tokens/s=82201.938 FLOP/token=36700160 FLOP/s=3.0168243e+12 MFU=n/a
+iter=000220 loss=4.420199126005173 time=6.6116536s tokens/s=79297.56 FLOP/token=36700160 FLOP/s=2.9102331e+12 MFU=n/a
+iter=000230 loss=4.349362552165985 time=6.6394657s tokens/s=78965.39 FLOP/token=36700160 FLOP/s=2.8980425e+12 MFU=n/a
+iter=000240 loss=4.28282105922699 time=6.6462417s tokens/s=78884.883 FLOP/token=36700160 FLOP/s=2.8950878e+12 MFU=n/a
+iter=000250 loss=4.224903583526611 time=6.6059354s tokens/s=79366.202 FLOP/token=36700160 FLOP/s=2.9127523e+12 MFU=n/a
+
