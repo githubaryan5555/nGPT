@@ -191,18 +191,21 @@ class SwiGLU(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, has_attention: bool = True):
         super().__init__()
+        self.has_attention = has_attention
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.self_attn = GQAAttention(config)
+        if self.has_attention:
+            self.self_attn = GQAAttention(config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = SwiGLU(config)
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, x, attention_mask=None):
-        x = x + self.hidden_dropout(
-            self.self_attn(self.input_layernorm(x), attention_mask)
-        )
+        if self.has_attention:
+            x = x + self.hidden_dropout(
+                self.self_attn(self.input_layernorm(x), attention_mask)
+            )
         x = x + self.hidden_dropout(
             self.mlp(self.post_attention_layernorm(x))
         )
@@ -225,7 +228,10 @@ class Model5555LM(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
-        self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
+        self.layers = nn.ModuleList(
+            Block(config, has_attention=(i % 2 == 0))
+            for i in range(config.num_hidden_layers)
+        )
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._init_weights)
@@ -233,7 +239,8 @@ class Model5555LM(nn.Module):
             self.lm_head.weight = self.embed_tokens.weight
         residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
         for layer in self.layers:
-            nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
+            if layer.has_attention:
+                nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
             nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
 
     def _init_weights(self, module):
@@ -310,9 +317,10 @@ class Model5555LM(nn.Module):
         d, f = self.config.hidden_size, self.config.intermediate_size
         h, kv, v, layers = self.config.num_attention_heads, self.config.num_key_value_heads, self.config.vocab_size, self.config.num_hidden_layers
         head_dim = d // h
-        projection = 2 * (d*d + 2*d*kv*head_dim)
+        attention = 2 * (d*d + 2*d*kv*head_dim)
         mlp = 6 * d * f
-        return layers * (projection + mlp + 4 * seq_len * d) + 2 * d * v
+        attention_layers = (layers + 1) // 2
+        return attention_layers * (attention + mlp + 4 * seq_len * d) + (layers - attention_layers) * mlp + 2 * d * v
 
     def estimate_mfu(self, tokens_per_second, peak_flops):
         for name, value in (("tokens_per_second", tokens_per_second), ("peak_flops", peak_flops)):
