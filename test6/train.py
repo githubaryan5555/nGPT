@@ -197,7 +197,7 @@ if checkpoint is not None and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 
 if cfg.compile_model:
-    model = torch.compile(model)
+    model = torch.compile(model, mode="reduce-overhead")
 if ddp:
     model = DDP(model, device_ids=[local_rank])
 raw_model = model.module if ddp else model
