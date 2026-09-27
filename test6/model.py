@@ -37,11 +37,19 @@ class Config:
 
     def __post_init__(self):
         integer_fields = (
-            "vocab_size", "hidden_size", "num_hidden_layers",
-            "intermediate_size", "num_attention_heads",
-            "num_key_value_heads", "max_seq_len",
-            "num_prefix_blocks", "num_shared_blocks", "shared_block_loops", "num_suffix_blocks",
+            "vocab_size",
+            "hidden_size",
+            "num_hidden_layers",
+            "intermediate_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "max_seq_len",
+            "num_prefix_blocks",
+            "num_shared_blocks",
+            "shared_block_loops",
+            "num_suffix_blocks",
         )
+
         for name in integer_fields:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
@@ -54,9 +62,7 @@ class Config:
         if self.hidden_size % self.num_attention_heads:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
         if self.num_attention_heads % self.num_key_value_heads:
-            raise ValueError(
-                "num_attention_heads must be divisible by num_key_value_heads"
-            )
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
         if self.num_key_value_heads > self.num_attention_heads:
             raise ValueError("num_key_value_heads must be <= num_attention_heads")
         if self.head_dim % 2:
@@ -68,10 +74,12 @@ class Config:
             value = getattr(self, name)
             if not isinstance(value, Real) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and > 0")
+
         for name in ("attention_dropout", "hidden_dropout"):
             value = getattr(self, name)
             if not isinstance(value, Real) or not math.isfinite(value) or not 0 <= value < 1:
                 raise ValueError(f"{name} must be finite and in [0, 1)")
+
         if not isinstance(self.tie_word_embeddings, bool):
             raise TypeError("tie_word_embeddings must be a bool")
 
@@ -98,12 +106,8 @@ class RMSNorm(nn.Module):
 class RoPE(nn.Module):
     def __init__(self, dim: int, max_seq_len: int, theta: float):
         super().__init__()
-        inv_freq = 1.0 / theta ** (
-            torch.arange(0, dim, 2, dtype=torch.float32) / dim
-        )
-        angles = torch.outer(
-            torch.arange(max_seq_len, dtype=torch.float32), inv_freq
-        )
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        angles = torch.outer(torch.arange(max_seq_len, dtype=torch.float32), inv_freq)
         self.register_buffer("cos", angles.cos(), persistent=False)
         self.register_buffer("sin", angles.sin(), persistent=False)
 
@@ -112,9 +116,9 @@ class RoPE(nn.Module):
         end = position_offset + seq_len
         if position_offset < 0 or end > self.cos.size(0):
             raise ValueError(
-                f"position range [{position_offset}, {end}) exceeds RoPE limit "
-                f"{self.cos.size(0)}"
+                f"position range [{position_offset}, {end}) exceeds RoPE limit {self.cos.size(0)}"
             )
+
         cos = self.cos[position_offset:end].to(device=x.device, dtype=x.dtype)
         sin = self.sin[position_offset:end].to(device=x.device, dtype=x.dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
@@ -132,10 +136,12 @@ class GQAAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.attention_dropout = config.attention_dropout
         self.apply_rope = apply_rope
+
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
         if self.apply_rope:
             self.rope = RoPE(config.head_dim, config.max_seq_len, config.rope_theta)
 
@@ -143,44 +149,53 @@ class GQAAttention(nn.Module):
         if self.num_queries_per_kv == 1:
             return x
         b, t, kv_heads, d = x.shape
-        return x[:, :, :, None, :].expand(
-            b, t, kv_heads, self.num_queries_per_kv, d
-        ).reshape(b, t, self.num_attention_heads, d)
+        return x[:, :, :, None, :].expand(b, t, kv_heads, self.num_queries_per_kv, d).reshape(
+            b, t, self.num_attention_heads, d
+        )
 
     def forward(self, x, attention_mask=None):
         b, t, _ = x.shape
         q = self.q_proj(x).view(b, t, self.num_attention_heads, self.head_dim)
         k = self.k_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
         v = self.v_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
+
         if self.apply_rope:
             q, k = self.rope(q), self.rope(k)
+
         q = q.transpose(1, 2)
         k = self.repeat_kv(k).transpose(1, 2)
         v = self.repeat_kv(v).transpose(1, 2)
 
-        attn_mask = None
-        is_causal = attention_mask is None
         if attention_mask is not None:
             if attention_mask.shape != (b, t):
                 raise ValueError(f"attention_mask must have shape {(b, t)}")
             if attention_mask.device != x.device:
                 attention_mask = attention_mask.to(device=x.device)
+
             if attention_mask.dtype == torch.bool:
                 valid = attention_mask
             elif attention_mask.is_floating_point() or attention_mask.dtype in (
-                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
+                torch.uint8,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
             ):
                 valid = attention_mask != 0
             else:
                 raise TypeError("attention_mask must be boolean or numeric")
-            causal = torch.ones((t, t), device=x.device, dtype=torch.bool).tril()
-            attn_mask = (
-                causal[None, None, :, :] & valid[:, None, None, :] & valid[:, None, :, None]
-            )
+
+            causal = torch.tril(torch.ones((t, t), device=x.device, dtype=torch.bool))
+            attn_mask = causal[None, None, :, :] & valid[:, None, None, :] & valid[:, None, :, None]
             is_causal = False
+        else:
+            attn_mask = None
+            is_causal = True
 
         y = F.scaled_dot_product_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             attn_mask=attn_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=is_causal,
@@ -210,30 +225,24 @@ class Block(nn.Module):
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, x, attention_mask=None, depth_embed=None, residual_scale=None):
-        # Add depth embedding if provided (for depth/iteration awareness)
         if depth_embed is not None:
             x = x + depth_embed
-        
-        attn_out = self.hidden_dropout(
-            self.self_attn(self.input_layernorm(x), attention_mask)
-        )
+
+        attn_out = self.self_attn(self.input_layernorm(x), attention_mask)
         if residual_scale is not None:
             attn_out = attn_out * residual_scale
-        x = x + attn_out
-        
-        mlp_out = self.hidden_dropout(
-            self.mlp(self.post_attention_layernorm(x))
-        )
+        x = x + self.hidden_dropout(attn_out)
+
+        mlp_out = self.mlp(self.post_attention_layernorm(x))
         if residual_scale is not None:
             mlp_out = mlp_out * residual_scale
-        x = x + mlp_out
-        
+        x = x + self.hidden_dropout(mlp_out)
         return x
 
 
 class Model5555LM(nn.Module):
     """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``.
-    
+
     Supports looped shared-block architecture where num_shared_blocks are repeated
     shared_block_loops times, with optional unique prefix and suffix blocks.
     Features:
@@ -252,48 +261,37 @@ class Model5555LM(nn.Module):
             values = asdict(config)
             values.update(overrides)
             config = Config(**values)
+
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
-        
-        # Build layers with looped shared-block architecture
+
         self.layers = nn.ModuleList()
-        
-        # Prefix blocks (unique parameters, with RoPE)
-        for _ in range(config.num_prefix_blocks):
-            self.layers.append(Block(config, apply_rope=True))
-        
-        # Shared blocks (reused across loops, NO RoPE—already applied in prefix)
-        self.shared_blocks = nn.ModuleList([Block(config, apply_rope=False) for _ in range(config.num_shared_blocks)])
-        
-        # Loop: repeat shared blocks
+        self.layers.extend(Block(config, apply_rope=True) for _ in range(config.num_prefix_blocks))
+
+        self.shared_blocks = nn.ModuleList(
+            Block(config, apply_rope=False) for _ in range(config.num_shared_blocks)
+        )
         for _ in range(config.shared_block_loops):
-            for shared_block in self.shared_blocks:
-                self.layers.append(shared_block)
-        
-        # Suffix blocks (unique parameters, with RoPE)
-        for _ in range(config.num_suffix_blocks):
-            self.layers.append(Block(config, apply_rope=True))
-        
-        # Depth embeddings: one learnable vector per layer for iteration awareness
-        self.depth_embeddings = nn.ParameterList([
+            self.layers.extend(self.shared_blocks)
+
+        self.layers.extend(Block(config, apply_rope=True) for _ in range(config.num_suffix_blocks))
+
+        self.depth_embeddings = nn.ParameterList(
             nn.Parameter(torch.zeros(config.hidden_size)) for _ in self.layers
-        ])
-        
-        # Per-layer residual scales: learnable scalar per layer to modulate residual strength
-        # Initialized to 0.9 to slightly dampen early iterations, then learn optimal scale
-        self.residual_scales = nn.ParameterList([
+        )
+        self.residual_scales = nn.ParameterList(
             nn.Parameter(torch.full((1,), 0.9)) for _ in self.layers
-        ])
-        
+        )
+
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
         self.apply(self._init_weights)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
-        
-        # Residual initialization scaled by num_hidden_layers
-        residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
+
+        residual_std = config.initializer_range / math.sqrt(2 * len(self.layers))
         for layer in self.layers:
             nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
             nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
@@ -315,11 +313,13 @@ class Model5555LM(nn.Module):
             raise ValueError(f"input_ids must have shape [B, T], got {tuple(input_ids.shape)}")
         if input_ids.dtype != torch.long:
             raise TypeError(f"input_ids must be torch.long, got {input_ids.dtype}")
+
         b, t = input_ids.shape
         if b <= 0 or t <= 0:
             raise ValueError("batch size and sequence length must be > 0")
         if t > self.config.max_seq_len:
             raise ValueError(f"sequence length {t} exceeds max_seq_len {self.config.max_seq_len}")
+
         if attention_mask is not None:
             if not isinstance(attention_mask, torch.Tensor):
                 raise TypeError("attention_mask must be a torch.Tensor")
@@ -330,25 +330,32 @@ class Model5555LM(nn.Module):
             if attention_mask.dtype == torch.bool:
                 attention_mask = attention_mask.to(torch.bool)
             elif attention_mask.is_floating_point() or attention_mask.dtype in (
-                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
+                torch.uint8,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
             ):
                 attention_mask = attention_mask != 0
             else:
                 raise TypeError("attention_mask must be boolean or numeric")
+
         if input_ids.min() < 0 or input_ids.max() >= self.config.vocab_size:
             raise ValueError(f"input_ids contains a token outside [0, {self.config.vocab_size})")
+
         x = self.embed_dropout(self.embed_tokens(input_ids))
         hidden_states = [] if output_hidden_states else None
-        
+
         for layer_idx, layer in enumerate(self.layers):
-            # Pass depth embedding and residual scale to give iteration awareness
-            x = layer(x, attention_mask, 
-                     depth_embed=self.depth_embeddings[layer_idx],
-                     residual_scale=self.residual_scales[layer_idx])
-            
+            x = layer(
+                x,
+                attention_mask,
+                depth_embed=self.depth_embeddings[layer_idx],
+                residual_scale=self.residual_scales[layer_idx],
+            )
             if output_hidden_states:
                 hidden_states.append(x)
-        
+
         logits = self.lm_head(self.final_layernorm(x))
         if output_hidden_states:
             return logits, hidden_states
@@ -375,12 +382,13 @@ class Model5555LM(nn.Module):
             raise TypeError("seq_len must be an int")
         if not 0 < seq_len <= self.config.max_seq_len:
             raise ValueError("seq_len is outside the model context")
+
         d, f = self.config.hidden_size, self.config.intermediate_size
-        h, kv, v, layers = self.config.num_attention_heads, self.config.num_key_value_heads, self.config.vocab_size, self.config.num_hidden_layers
+        h, kv, v = self.config.num_attention_heads, self.config.num_key_value_heads, self.config.vocab_size
         head_dim = d // h
-        projection = 2 * (d*d + 2*d*kv*head_dim)
+        projection = 2 * (d * d + 2 * d * kv * head_dim)
         mlp = 6 * d * f
-        return layers * (projection + mlp + 4 * seq_len * d) + 2 * d * v
+        return len(self.layers) * (projection + mlp + 4 * seq_len * d) + 2 * d * v
 
     def estimate_mfu(self, tokens_per_second, peak_flops):
         for name, value in (("tokens_per_second", tokens_per_second), ("peak_flops", peak_flops)):
@@ -396,8 +404,17 @@ class Model5555LM(nn.Module):
         return asdict(self.config)
 
     @torch.no_grad()
-    def generate(self, text, tokenizer, max_new_tokens=100, temperature=1.0,
-                 top_k=None, top_p=None, eos_token_id=None, do_sample=True):
+    def generate(
+        self,
+        text,
+        tokenizer,
+        max_new_tokens=100,
+        temperature=1.0,
+        top_k=None,
+        top_p=None,
+        eos_token_id=None,
+        do_sample=True,
+    ):
         if not isinstance(text, str):
             raise TypeError("text must be a string")
         if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
@@ -456,9 +473,11 @@ class Model5555LM(nn.Module):
                     if not torch.isfinite(logits).any(dim=-1).all():
                         raise RuntimeError("model produced no finite logits for sampling")
                     next_token = torch.multinomial(F.softmax(logits, dim=-1), 1)
+
                 output_ids = torch.cat((output_ids, next_token), dim=1)
                 if eos_token_id is not None and bool((next_token == eos_token_id).all()):
                     break
         finally:
             self.train(was_training)
+
         return tokenizer.decode(output_ids[0].tolist())
