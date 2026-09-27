@@ -179,43 +179,35 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
-class SharedSwiGLU(nn.Module):
-    """Shared gate and up projections for all layers."""
+class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        return F.silu(self.gate_proj(x)) * self.up_proj(x)
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Block(nn.Module):
-    def __init__(self, config: Config, layer_idx: int, shared_mlp: SharedSwiGLU):
+    def __init__(self, config: Config):
         super().__init__()
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = GQAAttention(config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.shared_mlp = shared_mlp
-        # Per-layer learned transformation matrix (hidden_size x hidden_size)
-        # initialized small to act as identity + adaptation
-        self.layer_transform = nn.Parameter(torch.eye(config.hidden_size) * 0.01)
-        # Per-layer down projection (intermediate_size -> hidden_size)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.mlp = SwiGLU(config)
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, x, attention_mask=None):
         x = x + self.hidden_dropout(
             self.self_attn(self.input_layernorm(x), attention_mask)
         )
-        # Shared MLP (gate + silu + up)
-        mlp_out = self.shared_mlp(self.post_attention_layernorm(x))
-        # Per-layer down projection
-        mlp_out = self.down_proj(mlp_out)
-        # Per-layer learned transformation (lightweight specialization)
-        mlp_out = mlp_out @ self.layer_transform
-        x = x + self.hidden_dropout(mlp_out)
+        x = x + self.hidden_dropout(
+            self.mlp(self.post_attention_layernorm(x))
+        )
         return x
+
 
 class Model5555LM(nn.Module):
     """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``."""
@@ -233,14 +225,7 @@ class Model5555LM(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
-        
-        # Shared MLP for all layers
-        self.shared_mlp = SharedSwiGLU(config)
-        
-        # Create blocks with shared MLP
-        self.layers = nn.ModuleList(
-            Block(config, i, self.shared_mlp) for i in range(config.num_hidden_layers)
-        )
+        self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._init_weights)
@@ -249,7 +234,7 @@ class Model5555LM(nn.Module):
         residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
         for layer in self.layers:
             nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
-            nn.init.normal_(layer.down_proj.weight, std=residual_std)
+            nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
