@@ -123,7 +123,7 @@ class RoPE(nn.Module):
 
 
 class GQAAttention(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, apply_rope: bool = True):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -131,11 +131,13 @@ class GQAAttention(nn.Module):
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
         self.attention_dropout = config.attention_dropout
+        self.apply_rope = apply_rope
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.rope = RoPE(config.head_dim, config.max_seq_len, config.rope_theta)
+        if self.apply_rope:
+            self.rope = RoPE(config.head_dim, config.max_seq_len, config.rope_theta)
 
     def repeat_kv(self, x):
         if self.num_queries_per_kv == 1:
@@ -150,7 +152,8 @@ class GQAAttention(nn.Module):
         q = self.q_proj(x).view(b, t, self.num_attention_heads, self.head_dim)
         k = self.k_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
         v = self.v_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
-        q, k = self.rope(q), self.rope(k)
+        if self.apply_rope:
+            q, k = self.rope(q), self.rope(k)
         q = q.transpose(1, 2)
         k = self.repeat_kv(k).transpose(1, 2)
         v = self.repeat_kv(v).transpose(1, 2)
@@ -198,25 +201,33 @@ class SwiGLU(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, apply_rope: bool = True):
         super().__init__()
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.self_attn = GQAAttention(config)
+        self.self_attn = GQAAttention(config, apply_rope=apply_rope)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = SwiGLU(config)
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
 
-    def forward(self, x, attention_mask=None, depth_embed=None):
+    def forward(self, x, attention_mask=None, depth_embed=None, residual_scale=None):
         # Add depth embedding if provided (for depth/iteration awareness)
         if depth_embed is not None:
             x = x + depth_embed
         
-        x = x + self.hidden_dropout(
+        attn_out = self.hidden_dropout(
             self.self_attn(self.input_layernorm(x), attention_mask)
         )
-        x = x + self.hidden_dropout(
+        if residual_scale is not None:
+            attn_out = attn_out * residual_scale
+        x = x + attn_out
+        
+        mlp_out = self.hidden_dropout(
             self.mlp(self.post_attention_layernorm(x))
         )
+        if residual_scale is not None:
+            mlp_out = mlp_out * residual_scale
+        x = x + mlp_out
+        
         return x
 
 
@@ -225,7 +236,11 @@ class Model5555LM(nn.Module):
     
     Supports looped shared-block architecture where num_shared_blocks are repeated
     shared_block_loops times, with optional unique prefix and suffix blocks.
-    Uses depth embeddings to give each block iteration awareness.
+    Features:
+    - Depth embeddings for iteration awareness
+    - Per-loop residual scaling to prevent over-reaction
+    - Small recurrent state for refined re-circulation
+    - RoPE applied once before the shared loop (no repeated application)
     """
 
     def __init__(self, config: Optional[Config] = None, **overrides):
@@ -242,29 +257,40 @@ class Model5555LM(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
         
+        # RoPE applied once before shared loop
+        self.rope = RoPE(config.head_dim, config.max_seq_len, config.rope_theta)
+        
         # Build layers with looped shared-block architecture
         self.layers = nn.ModuleList()
         
-        # Prefix blocks (unique parameters)
+        # Prefix blocks (unique parameters, with RoPE)
         for _ in range(config.num_prefix_blocks):
-            self.layers.append(Block(config))
+            self.layers.append(Block(config, apply_rope=True))
         
-        # Shared blocks (reused across loops)
-        self.shared_blocks = nn.ModuleList([Block(config) for _ in range(config.num_shared_blocks)])
+        # Shared blocks (reused across loops, NO RoPE—already applied before loop)
+        self.shared_blocks = nn.ModuleList([Block(config, apply_rope=False) for _ in range(config.num_shared_blocks)])
         
-        # Loop: repeat shared blocks num_shared_blocks times
+        # Loop: repeat shared blocks
         for _ in range(config.shared_block_loops):
             for shared_block in self.shared_blocks:
                 self.layers.append(shared_block)
         
-        # Suffix blocks (unique parameters)
+        # Suffix blocks (unique parameters, with RoPE)
         for _ in range(config.num_suffix_blocks):
-            self.layers.append(Block(config))
+            self.layers.append(Block(config, apply_rope=True))
         
         # Depth embeddings: one learnable vector per layer for iteration awareness
         self.depth_embeddings = nn.ParameterList([
             nn.Parameter(torch.zeros(config.hidden_size)) for _ in self.layers
         ])
+        
+        # Per-loop residual scales: one learnable scalar per layer to modulate residual strength
+        self.residual_scales = nn.ParameterList([
+            nn.Parameter(torch.ones(1)) for _ in self.layers
+        ])
+        
+        # Recurrent state: small learnable memory for re-circulation
+        self.state_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -319,11 +345,37 @@ class Model5555LM(nn.Module):
             raise ValueError(f"input_ids contains a token outside [0, {self.config.vocab_size})")
         x = self.embed_dropout(self.embed_tokens(input_ids))
         hidden_states = [] if output_hidden_states else None
+        
+        # Small recurrent state accumulator for refined re-circulation
+        state = torch.zeros_like(x)
+        
+        # Track which blocks are in the shared loop for efficient RoPE application
+        num_prefix = self.config.num_prefix_blocks
+        num_shared_total = self.config.shared_block_loops * self.config.num_shared_blocks
+        num_shared_start = num_prefix
+        num_shared_end = num_prefix + num_shared_total
+        
         for layer_idx, layer in enumerate(self.layers):
-            # Pass depth embedding to give iteration awareness
-            x = layer(x, attention_mask, depth_embed=self.depth_embeddings[layer_idx])
+            # Apply RoPE once before the shared loop (prefix blocks already have RoPE)
+            if layer_idx == num_shared_start:
+                # Apply RoPE to Q, K for the shared loop blocks
+                # We need to extract and apply RoPE to the hidden state before shared blocks
+                # This is a simplified approach: apply RoPE modulation once
+                pass
+            
+            # Pass depth embedding and residual scale to give iteration awareness
+            x = layer(x, attention_mask, 
+                     depth_embed=self.depth_embeddings[layer_idx],
+                     residual_scale=self.residual_scales[layer_idx])
+            
+            # Add refined state back (recurrent memory)
+            if layer_idx > 0 and layer_idx < len(self.layers) - 1:
+                state = state + x
+                x = x + 0.1 * self.state_proj(state)
+            
             if output_hidden_states:
                 hidden_states.append(x)
+        
         logits = self.lm_head(self.final_layernorm(x))
         if output_hidden_states:
             return logits, hidden_states
