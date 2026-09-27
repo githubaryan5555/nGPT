@@ -180,6 +180,7 @@ class GQAAttention(nn.Module):
 
 
 
+
 class SwiGLU(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -187,52 +188,96 @@ class SwiGLU(nn.Module):
         h = config.hidden_size
         d = config.intermediate_size
 
-        assert d % 8 == 0, "intermediate_size must be divisible by 8"
-
-        self.hidden_size = h
-        self.intermediate_size = d
-
         self.num_blocks = 8
         self.active_blocks = 2
+
+        assert d % self.num_blocks == 0
+
         self.block_size = d // self.num_blocks
 
-        self.gate_proj = nn.Linear(h, d, bias=False)
-        self.up_proj = nn.Linear(h, d, bias=False)
-        self.down_proj = nn.Linear(d, h, bias=False)
+        # Each block owns its own projection.
+        self.gate_proj = nn.ModuleList([
+            nn.Linear(
+                h,
+                self.block_size,
+                bias=False
+            )
+            for _ in range(self.num_blocks)
+        ])
 
-        # Chooses which blocks each token uses
-        self.router = nn.Linear(h, self.num_blocks, bias=False)
+        self.up_proj = nn.ModuleList([
+            nn.Linear(
+                h,
+                self.block_size,
+                bias=False
+            )
+            for _ in range(self.num_blocks)
+        ])
+
+        self.down_proj = nn.ModuleList([
+            nn.Linear(
+                self.block_size,
+                h,
+                bias=False
+            )
+            for _ in range(self.num_blocks)
+        ])
+
+        # Token -> block
+        self.router = nn.Linear(
+            h,
+            self.num_blocks,
+            bias=False
+        )
 
     def forward(self, x):
-        # x: [B, T, H]
 
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
+        B, T, H = x.shape
 
-        hidden = F.silu(gate) * up
-
-        # [B, T, 8]
+        # [B,T,8]
         scores = self.router(x)
 
-        # Select exactly 2 blocks per token
-        indices = scores.topk(
+        # [B,T,2]
+        selected = scores.topk(
             self.active_blocks,
             dim=-1
         ).indices
 
-        # [B, T, 8]
-        mask = torch.zeros_like(scores)
-        mask.scatter_(-1, indices, 1.0)
+        output = torch.zeros_like(x)
 
-        # Expand block mask to neurons
-        mask = mask.repeat_interleave(
-            self.block_size,
-            dim=-1
-        )
+        # -------------------------------------------------
+        # Process each block only for tokens that selected it
+        # -------------------------------------------------
 
-        hidden = hidden * mask
+        for block_idx in range(self.num_blocks):
 
-        return self.down_proj(hidden)
+            token_mask = (
+                selected == block_idx
+            ).any(dim=-1)
+
+            if not token_mask.any():
+                continue
+
+            # Flatten selected tokens
+            x_selected = x[token_mask]
+
+            gate = self.gate_proj[block_idx](
+                x_selected
+            )
+
+            up = self.up_proj[block_idx](
+                x_selected
+            )
+
+            hidden = F.silu(gate) * up
+
+            contribution = self.down_proj[block_idx](
+                hidden
+            )
+
+            output[token_mask] += contribution
+
+        return output
 
 
 
