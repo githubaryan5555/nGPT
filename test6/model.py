@@ -180,7 +180,7 @@ class GQAAttention(nn.Module):
 
 
 
-class BlockSparseSwiGLU(nn.Module):
+class SwiGLU(nn.Module):
     def __init__(self, config):
         super().__init__()
 
