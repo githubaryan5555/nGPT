@@ -178,29 +178,24 @@ class GQAAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(b, t, self.hidden_size)
         return self.o_proj(y)
 
-class SwiGLU(nn.Module):
-    def __init__(self, config):
+class SparseSwiGLU(nn.Module):
+    def __init__(self, config: Config):
         super().__init__()
 
         h = config.hidden_size
         d = config.intermediate_size
 
+        assert d % 8 == 0
+
         self.num_blocks = 8
         self.active_blocks = 2
-
-        assert d % self.num_blocks == 0
         self.block_size = d // self.num_blocks
 
-        self.gate_proj = nn.Linear(
-            h, d, bias=False
-        )
-        self.up_proj = nn.Linear(
-            h, d, bias=False
-        )
-        self.down_proj = nn.Linear(
-            d, h, bias=False
-        )
+        self.gate_proj = nn.Linear(h, d, bias=False)
+        self.up_proj = nn.Linear(h, d, bias=False)
+        self.down_proj = nn.Linear(d, h, bias=False)
 
+        # Router: token -> 8 blocks
         self.router = nn.Linear(
             h,
             self.num_blocks,
@@ -210,45 +205,96 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         B, T, H = x.shape
 
-        # ---------------------------------------
-        # Choose 2 of 8 blocks for each token
-        # ---------------------------------------
+        # -----------------------------------------
+        # ROUTER
+        # -----------------------------------------
 
-        scores = self.router(x)  # [B,T,8]
+        scores = self.router(x)             # [B,T,8]
 
         selected = scores.topk(
             self.active_blocks,
             dim=-1
-        ).indices
+        ).indices                           # [B,T,2]
 
-        mask = torch.zeros_like(scores)
+        # -----------------------------------------
+        # Flatten tokens
+        # -----------------------------------------
 
-        mask.scatter_(
-            -1,
-            selected,
-            1.0
-        )
+        x_flat = x.reshape(-1, H)
+        selected_flat = selected.reshape(-1, 2)
 
-        # [B,T,8] -> [B,T,D]
-        mask = mask.repeat_interleave(
+        N = x_flat.shape[0]
+
+        # -----------------------------------------
+        # Split weights into 8 blocks
+        # -----------------------------------------
+
+        gate_weight = self.gate_proj.weight
+        up_weight = self.up_proj.weight
+
+        gate_weight = gate_weight.reshape(
+            self.num_blocks,
             self.block_size,
-            dim=-1
+            H
         )
 
-        # ---------------------------------------
-        # SwiGLU
-        # ---------------------------------------
+        up_weight = up_weight.reshape(
+            self.num_blocks,
+            self.block_size,
+            H
+        )
 
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
+        # -----------------------------------------
+        # Output intermediate
+        # -----------------------------------------
 
-        hidden = F.silu(gate) * up
+        hidden = x.new_zeros(
+            N,
+            self.block_size * self.num_blocks
+        )
 
-        # Keep only 2/8 blocks
-        hidden = hidden * mask
+        # -----------------------------------------
+        # ONLY COMPUTE SELECTED BLOCKS
+        # -----------------------------------------
 
-        return self.down_proj(hidden)
+        for b in range(self.num_blocks):
 
+            token_mask = (
+                selected_flat == b
+            ).any(dim=-1)
+
+            if not token_mask.any():
+                continue
+
+            xb = x_flat[token_mask]
+
+            gate = F.linear(
+                xb,
+                gate_weight[b]
+            )
+
+            up = F.linear(
+                xb,
+                up_weight[b]
+            )
+
+            hb = F.silu(gate) * up
+
+            start = b * self.block_size
+            end = start + self.block_size
+
+            hidden[token_mask, start:end] = hb
+
+        # -----------------------------------------
+        # Down projection
+        # -----------------------------------------
+
+        output = F.linear(
+            hidden,
+            self.down_proj.weight
+        )
+
+        return output.reshape(B, T, H)
 
 
 class Block(nn.Module):
