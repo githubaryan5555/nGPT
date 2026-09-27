@@ -238,9 +238,8 @@ class Model5555LM(nn.Module):
     shared_block_loops times, with optional unique prefix and suffix blocks.
     Features:
     - Depth embeddings for iteration awareness
-    - Per-loop residual scaling to prevent over-reaction
-    - Small recurrent state for refined re-circulation
-    - RoPE applied once before the shared loop (no repeated application)
+    - Per-layer residual scaling to prevent over-reaction in repeated passes
+    - RoPE applied in prefix/suffix blocks only (no redundant reapplication)
     """
 
     def __init__(self, config: Optional[Config] = None, **overrides):
@@ -257,9 +256,6 @@ class Model5555LM(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
         
-        # RoPE applied once before shared loop
-        self.rope = RoPE(config.head_dim, config.max_seq_len, config.rope_theta)
-        
         # Build layers with looped shared-block architecture
         self.layers = nn.ModuleList()
         
@@ -267,7 +263,7 @@ class Model5555LM(nn.Module):
         for _ in range(config.num_prefix_blocks):
             self.layers.append(Block(config, apply_rope=True))
         
-        # Shared blocks (reused across loops, NO RoPE—already applied before loop)
+        # Shared blocks (reused across loops, NO RoPE—already applied in prefix)
         self.shared_blocks = nn.ModuleList([Block(config, apply_rope=False) for _ in range(config.num_shared_blocks)])
         
         # Loop: repeat shared blocks
@@ -284,13 +280,11 @@ class Model5555LM(nn.Module):
             nn.Parameter(torch.zeros(config.hidden_size)) for _ in self.layers
         ])
         
-        # Per-loop residual scales: one learnable scalar per layer to modulate residual strength
+        # Per-layer residual scales: learnable scalar per layer to modulate residual strength
+        # Initialized to 0.9 to slightly dampen early iterations, then learn optimal scale
         self.residual_scales = nn.ParameterList([
-            nn.Parameter(torch.ones(1)) for _ in self.layers
+            nn.Parameter(torch.full((1,), 0.9)) for _ in self.layers
         ])
-        
-        # Recurrent state: small learnable memory for re-circulation
-        self.state_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -346,32 +340,11 @@ class Model5555LM(nn.Module):
         x = self.embed_dropout(self.embed_tokens(input_ids))
         hidden_states = [] if output_hidden_states else None
         
-        # Small recurrent state accumulator for refined re-circulation
-        state = torch.zeros_like(x)
-        
-        # Track which blocks are in the shared loop for efficient RoPE application
-        num_prefix = self.config.num_prefix_blocks
-        num_shared_total = self.config.shared_block_loops * self.config.num_shared_blocks
-        num_shared_start = num_prefix
-        num_shared_end = num_prefix + num_shared_total
-        
         for layer_idx, layer in enumerate(self.layers):
-            # Apply RoPE once before the shared loop (prefix blocks already have RoPE)
-            if layer_idx == num_shared_start:
-                # Apply RoPE to Q, K for the shared loop blocks
-                # We need to extract and apply RoPE to the hidden state before shared blocks
-                # This is a simplified approach: apply RoPE modulation once
-                pass
-            
             # Pass depth embedding and residual scale to give iteration awareness
             x = layer(x, attention_mask, 
                      depth_embed=self.depth_embeddings[layer_idx],
                      residual_scale=self.residual_scales[layer_idx])
-            
-            # Add refined state back (recurrent memory)
-            if layer_idx > 0 and layer_idx < len(self.layers) - 1:
-                state = state + x
-                x = x + 0.1 * self.state_proj(state)
             
             if output_hidden_states:
                 hidden_states.append(x)
