@@ -185,17 +185,25 @@ class SwiGLU(nn.Module):
         h = config.hidden_size
         d = config.intermediate_size
 
-        assert d % 8 == 0
+        assert d % 8 == 0, \
+            "intermediate_size must be divisible by 8"
 
         self.num_blocks = 8
         self.active_blocks = 2
         self.block_size = d // self.num_blocks
 
-        self.gate_proj = nn.Linear(h, d, bias=False)
-        self.up_proj = nn.Linear(h, d, bias=False)
-        self.down_proj = nn.Linear(d, h, bias=False)
+        self.gate_proj = nn.Linear(
+            h, d, bias=False
+        )
 
-        # Router: token -> 8 blocks
+        self.up_proj = nn.Linear(
+            h, d, bias=False
+        )
+
+        self.down_proj = nn.Linear(
+            d, h, bias=False
+        )
+
         self.router = nn.Linear(
             h,
             self.num_blocks,
@@ -206,61 +214,60 @@ class SwiGLU(nn.Module):
         B, T, H = x.shape
 
         # -----------------------------------------
-        # ROUTER
+        # Router
         # -----------------------------------------
 
-        scores = self.router(x)             # [B,T,8]
+        scores = self.router(x)
 
         selected = scores.topk(
             self.active_blocks,
             dim=-1
-        ).indices                           # [B,T,2]
+        ).indices
 
         # -----------------------------------------
         # Flatten tokens
         # -----------------------------------------
 
         x_flat = x.reshape(-1, H)
-        selected_flat = selected.reshape(-1, 2)
+        selected_flat = selected.reshape(-1, self.active_blocks)
 
         N = x_flat.shape[0]
 
         # -----------------------------------------
-        # Split weights into 8 blocks
+        # Weight blocks
         # -----------------------------------------
 
-        gate_weight = self.gate_proj.weight
-        up_weight = self.up_proj.weight
-
-        gate_weight = gate_weight.reshape(
+        gate_weight = self.gate_proj.weight.reshape(
             self.num_blocks,
             self.block_size,
             H
         )
 
-        up_weight = up_weight.reshape(
+        up_weight = self.up_proj.weight.reshape(
             self.num_blocks,
             self.block_size,
             H
         )
 
         # -----------------------------------------
-        # Output intermediate
+        # Sparse intermediate
         # -----------------------------------------
 
-        hidden = x.new_zeros(
+        hidden = torch.zeros(
             N,
-            self.block_size * self.num_blocks
+            self.intermediate_size,
+            device=x.device,
+            dtype=x.dtype
         )
 
         # -----------------------------------------
-        # ONLY COMPUTE SELECTED BLOCKS
+        # Only calculate selected blocks
         # -----------------------------------------
 
-        for b in range(self.num_blocks):
+        for block_idx in range(self.num_blocks):
 
             token_mask = (
-                selected_flat == b
+                selected_flat == block_idx
             ).any(dim=-1)
 
             if not token_mask.any():
@@ -270,20 +277,22 @@ class SwiGLU(nn.Module):
 
             gate = F.linear(
                 xb,
-                gate_weight[b]
+                gate_weight[block_idx]
             )
 
             up = F.linear(
                 xb,
-                up_weight[b]
+                up_weight[block_idx]
             )
 
             hb = F.silu(gate) * up
 
-            start = b * self.block_size
+            start = block_idx * self.block_size
             end = start + self.block_size
 
-            hidden[token_mask, start:end] = hb
+            hidden[token_mask, start:end] = (
+                hb.to(hidden.dtype)
+            )
 
         # -----------------------------------------
         # Down projection
