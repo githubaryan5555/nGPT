@@ -30,19 +30,26 @@ class Config:
     max_seq_len: int = cfg.max_seq_len
     tie_word_embeddings: bool = cfg.tie_word_embeddings
     initializer_range: float = cfg.initializer_range
+    num_prefix_blocks: int = cfg.num_prefix_blocks
+    num_shared_blocks: int = cfg.num_shared_blocks
+    shared_block_loops: int = cfg.shared_block_loops
+    num_suffix_blocks: int = cfg.num_suffix_blocks
 
     def __post_init__(self):
         integer_fields = (
             "vocab_size", "hidden_size", "num_hidden_layers",
             "intermediate_size", "num_attention_heads",
             "num_key_value_heads", "max_seq_len",
+            "num_prefix_blocks", "num_shared_blocks", "shared_block_loops", "num_suffix_blocks",
         )
         for name in integer_fields:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be an int")
-            if value <= 0:
+            if value <= 0 and name not in ("num_prefix_blocks", "num_suffix_blocks"):
                 raise ValueError(f"{name} must be > 0")
+            if value < 0 and name in ("num_prefix_blocks", "num_suffix_blocks"):
+                raise ValueError(f"{name} must be >= 0")
 
         if self.hidden_size % self.num_attention_heads:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
@@ -210,7 +217,11 @@ class Block(nn.Module):
 
 
 class Model5555LM(nn.Module):
-    """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``."""
+    """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``.
+    
+    Supports looped shared-block architecture where num_shared_blocks are repeated
+    shared_block_loops times, with optional unique prefix and suffix blocks.
+    """
 
     def __init__(self, config: Optional[Config] = None, **overrides):
         super().__init__()
@@ -225,12 +236,33 @@ class Model5555LM(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
-        self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
+        
+        # Build layers with looped shared-block architecture
+        self.layers = nn.ModuleList()
+        
+        # Prefix blocks (unique parameters)
+        for _ in range(config.num_prefix_blocks):
+            self.layers.append(Block(config))
+        
+        # Shared blocks (reused across loops)
+        self.shared_blocks = nn.ModuleList([Block(config) for _ in range(config.num_shared_blocks)])
+        
+        # Loop: repeat shared blocks num_shared_blocks times
+        for _ in range(config.shared_block_loops):
+            for shared_block in self.shared_blocks:
+                self.layers.append(shared_block)
+        
+        # Suffix blocks (unique parameters)
+        for _ in range(config.num_suffix_blocks):
+            self.layers.append(Block(config))
+        
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._init_weights)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
+        
+        # Residual initialization scaled by num_hidden_layers
         residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
         for layer in self.layers:
             nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
