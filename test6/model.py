@@ -180,37 +180,19 @@ class GQAAttention(nn.Module):
 
 
 class SparseSwiGLU(nn.Module):
-    """SwiGLU with top-k sparsity to reduce active MLP neurons per token."""
-
     def __init__(self, config: Config, sparsity_ratio: float = 0.25):
         super().__init__()
-        if not isinstance(sparsity_ratio, Real) or not math.isfinite(sparsity_ratio):
-            raise ValueError("sparsity_ratio must be a finite real number")
-        if not 0 < sparsity_ratio < 1:
-            raise ValueError("sparsity_ratio must be in the open interval (0, 1)")
-
-        self.intermediate_size = config.intermediate_size
-        self.sparsity_ratio = float(sparsity_ratio)
-        self.k = max(1, int(round(self.intermediate_size * self.sparsity_ratio)))
-
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.dropout_p = sparsity_ratio
 
     def forward(self, x):
-        gate = self.gate_proj(x)
-        gate_active = F.silu(gate)
+        gate = F.silu(self.gate_proj(x))
         up = self.up_proj(x)
-
-        scores = torch.abs(gate_active)
-        _, topk_idx = torch.topk(scores, self.k, dim=-1, sorted=False)
-
-        sparse_gate = torch.zeros_like(gate_active)
-        sparse_up = torch.zeros_like(up)
-        sparse_gate.scatter_(-1, topk_idx, gate_active.gather(-1, topk_idx))
-        sparse_up.scatter_(-1, topk_idx, up.gather(-1, topk_idx))
-
-        return self.down_proj(sparse_gate * sparse_up)
+        gate = F.dropout(gate, p=self.dropout_p, training=self.training)
+        up = F.dropout(up, p=self.dropout_p, training=self.training)
+        return self.down_proj(gate * up)
 
 
 class SwiGLU(nn.Module):
