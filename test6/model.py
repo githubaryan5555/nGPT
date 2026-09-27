@@ -206,7 +206,11 @@ class Block(nn.Module):
         self.mlp = SwiGLU(config)
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
 
-    def forward(self, x, attention_mask=None):
+    def forward(self, x, attention_mask=None, depth_embed=None):
+        # Add depth embedding if provided (for depth/iteration awareness)
+        if depth_embed is not None:
+            x = x + depth_embed
+        
         x = x + self.hidden_dropout(
             self.self_attn(self.input_layernorm(x), attention_mask)
         )
@@ -221,6 +225,7 @@ class Model5555LM(nn.Module):
     
     Supports looped shared-block architecture where num_shared_blocks are repeated
     shared_block_loops times, with optional unique prefix and suffix blocks.
+    Uses depth embeddings to give each block iteration awareness.
     """
 
     def __init__(self, config: Optional[Config] = None, **overrides):
@@ -255,6 +260,11 @@ class Model5555LM(nn.Module):
         # Suffix blocks (unique parameters)
         for _ in range(config.num_suffix_blocks):
             self.layers.append(Block(config))
+        
+        # Depth embeddings: one learnable vector per layer for iteration awareness
+        self.depth_embeddings = nn.ParameterList([
+            nn.Parameter(torch.zeros(config.hidden_size)) for _ in self.layers
+        ])
         
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -309,8 +319,9 @@ class Model5555LM(nn.Module):
             raise ValueError(f"input_ids contains a token outside [0, {self.config.vocab_size})")
         x = self.embed_dropout(self.embed_tokens(input_ids))
         hidden_states = [] if output_hidden_states else None
-        for layer in self.layers:
-            x = layer(x, attention_mask)
+        for layer_idx, layer in enumerate(self.layers):
+            # Pass depth embedding to give iteration awareness
+            x = layer(x, attention_mask, depth_embed=self.depth_embeddings[layer_idx])
             if output_hidden_states:
                 hidden_states.append(x)
         logits = self.lm_head(self.final_layernorm(x))
