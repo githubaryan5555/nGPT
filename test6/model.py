@@ -180,14 +180,35 @@ class GQAAttention(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+
+        self.gate_proj = nn.Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=False
+        )
+
+        self.alpha = nn.Parameter(torch.ones(config.intermediate_size))
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+
+        gate = gate * torch.sigmoid(self.alpha * gate)
+
+        return self.down_proj(gate * up)
+
 
 
 class Block(nn.Module):
