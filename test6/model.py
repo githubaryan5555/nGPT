@@ -22,9 +22,11 @@ class Config:
     num_hidden_layers: int = cfg.num_hidden_layers
     intermediate_size: int = cfg.intermediate_size
     num_attention_heads: int = cfg.num_attention_heads
+    num_key_value_heads: int = cfg.num_key_value_heads
     attention_dropout: float = cfg.attention_dropout
     hidden_dropout: float = cfg.hidden_dropout
     rms_norm_eps: float = cfg.rms_norm_eps
+    rope_theta: float = cfg.rope_theta
     max_seq_len: int = cfg.max_seq_len
     tie_word_embeddings: bool = cfg.tie_word_embeddings
     initializer_range: float = cfg.initializer_range
@@ -32,7 +34,8 @@ class Config:
     def __post_init__(self):
         integer_fields = (
             "vocab_size", "hidden_size", "num_hidden_layers",
-            "intermediate_size", "num_attention_heads", "max_seq_len",
+            "intermediate_size", "num_attention_heads",
+            "num_key_value_heads", "max_seq_len",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -43,10 +46,18 @@ class Config:
 
         if self.hidden_size % self.num_attention_heads:
             raise ValueError("hidden_size must be divisible by num_attention_heads")
+        if self.num_attention_heads % self.num_key_value_heads:
+            raise ValueError(
+                "num_attention_heads must be divisible by num_key_value_heads"
+            )
+        if self.num_key_value_heads > self.num_attention_heads:
+            raise ValueError("num_key_value_heads must be <= num_attention_heads")
+        if self.head_dim % 2:
+            raise ValueError("head_dim must be even for RoPE")
         if self.intermediate_size <= self.hidden_size:
             raise ValueError("intermediate_size must be greater than hidden_size")
 
-        for name in ("rms_norm_eps", "initializer_range"):
+        for name in ("rms_norm_eps", "rope_theta", "initializer_range"):
             value = getattr(self, name)
             if not isinstance(value, Real) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and > 0")
@@ -61,6 +72,10 @@ class Config:
     def head_dim(self):
         return self.hidden_size // self.num_attention_heads
 
+    @property
+    def num_queries_per_kv(self):
+        return self.num_attention_heads // self.num_key_value_heads
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float):
@@ -73,27 +88,65 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(variance + self.eps).to(x.dtype) * self.weight
 
 
+class RoPE(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int, theta: float):
+        super().__init__()
+        inv_freq = 1.0 / theta ** (
+            torch.arange(0, dim, 2, dtype=torch.float32) / dim
+        )
+        angles = torch.outer(
+            torch.arange(max_seq_len, dtype=torch.float32), inv_freq
+        )
+        self.register_buffer("cos", angles.cos(), persistent=False)
+        self.register_buffer("sin", angles.sin(), persistent=False)
+
+    def forward(self, x, position_offset=0):
+        seq_len = x.size(1)
+        end = position_offset + seq_len
+        if position_offset < 0 or end > self.cos.size(0):
+            raise ValueError(
+                f"position range [{position_offset}, {end}) exceeds RoPE limit "
+                f"{self.cos.size(0)}"
+            )
+        cos = self.cos[position_offset:end].to(device=x.device, dtype=x.dtype)
+        sin = self.sin[position_offset:end].to(device=x.device, dtype=x.dtype)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        even, odd = x[..., 0::2], x[..., 1::2]
+        return torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1).flatten(-2)
+
+
 class GQAAttention(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_queries_per_kv = config.num_queries_per_kv
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
         self.attention_dropout = config.attention_dropout
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.rope = RoPE(config.head_dim, config.max_seq_len, config.rope_theta)
+
+    def repeat_kv(self, x):
+        if self.num_queries_per_kv == 1:
+            return x
+        b, t, kv_heads, d = x.shape
+        return x[:, :, :, None, :].expand(
+            b, t, kv_heads, self.num_queries_per_kv, d
+        ).reshape(b, t, self.num_attention_heads, d)
 
     def forward(self, x, attention_mask=None):
         b, t, _ = x.shape
         q = self.q_proj(x).view(b, t, self.num_attention_heads, self.head_dim)
-        k = self.k_proj(x).view(b, t, self.num_attention_heads, self.head_dim)
-        v = self.v_proj(x).view(b, t, self.num_attention_heads, self.head_dim)
-
+        k = self.k_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
+        v = self.v_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
+        q, k = self.rope(q), self.rope(k)
         q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        k = self.repeat_kv(k).transpose(1, 2)
+        v = self.repeat_kv(v).transpose(1, 2)
 
         attn_mask = None
         is_causal = attention_mask is None
@@ -255,9 +308,9 @@ class Model5555LM(nn.Module):
         if not 0 < seq_len <= self.config.max_seq_len:
             raise ValueError("seq_len is outside the model context")
         d, f = self.config.hidden_size, self.config.intermediate_size
-        h, v, layers = self.config.num_attention_heads, self.config.vocab_size, self.config.num_hidden_layers
+        h, kv, v, layers = self.config.num_attention_heads, self.config.num_key_value_heads, self.config.vocab_size, self.config.num_hidden_layers
         head_dim = d // h
-        projection = 2 * (d*d + 2*d*head_dim)
+        projection = 2 * (d*d + 2*d*kv*head_dim)
         mlp = 6 * d * f
         return layers * (projection + mlp + 4 * seq_len * d) + 2 * d * v
 
