@@ -30,14 +30,12 @@ class Config:
     max_seq_len: int = cfg.max_seq_len
     tie_word_embeddings: bool = cfg.tie_word_embeddings
     initializer_range: float = cfg.initializer_range
-    num_output_tokens: int = cfg.num_output_tokens if hasattr(cfg, 'num_output_tokens') else 4
-    mtp_context_dim: int = cfg.mtp_context_dim if hasattr(cfg, 'mtp_context_dim') else None
 
     def __post_init__(self):
         integer_fields = (
             "vocab_size", "hidden_size", "num_hidden_layers",
             "intermediate_size", "num_attention_heads",
-            "num_key_value_heads", "max_seq_len", "num_output_tokens",
+            "num_key_value_heads", "max_seq_len",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -69,10 +67,6 @@ class Config:
                 raise ValueError(f"{name} must be finite and in [0, 1)")
         if not isinstance(self.tie_word_embeddings, bool):
             raise TypeError("tie_word_embeddings must be a bool")
-
-        # Set default mtp_context_dim if not provided
-        if self.mtp_context_dim is None:
-            self.mtp_context_dim = self.hidden_size // 2
 
     @property
     def head_dim(self):
@@ -215,71 +209,8 @@ class Block(nn.Module):
         return x
 
 
-class SharedMultiTokenHead(nn.Module):
-    """Multi-token prediction head with shared output projection.
-
-    Predicts num_output_tokens tokens in parallel from final hidden state.
-    Each position uses position embedding + shared projection to vocab.
-    """
-    def __init__(self, config: Config):
-        super().__init__()
-        self.num_output_tokens = config.num_output_tokens
-        self.context_dim = config.mtp_context_dim
-        self.vocab_size = config.vocab_size
-
-        # Compress hidden state to context dimension
-        self.context_proj = nn.Linear(config.hidden_size, self.context_dim, bias=False)
-
-        # Position-aware embeddings: tells each head which token offset it's predicting
-        self.position_embed = nn.Embedding(config.num_output_tokens, self.context_dim)
-
-        # Shared output projection to vocabulary (all 4 heads use this)
-        self.output_proj = nn.Linear(self.context_dim, config.vocab_size, bias=False)
-
-        # Optional: scale position embeddings to avoid sudden shifts
-        self.position_scale = nn.Parameter(torch.ones(1) * 0.1)
-
-    def forward(self, x):
-        """
-        Args:
-            x: [B, T, H] hidden states from final layer
-
-        Returns:
-            logits: [B, T, num_output_tokens, V] predictions for 4 future tokens
-        """
-        B, T, H = x.shape
-
-        # Project to smaller context dimension
-        context = self.context_proj(x)  # [B, T, D]
-
-        # Build position-aware representations for each output token
-        head_representations = []
-        for pos_idx in range(self.num_output_tokens):
-            # Position signal: which of the 4 tokens are we predicting?
-            pos_embed = self.position_embed(torch.tensor(pos_idx, device=x.device, dtype=torch.long))
-            pos_signal = pos_embed * self.position_scale  # Scale down influence
-
-            # Combine context with position signal
-            head_repr = context + pos_signal  # [B, T, D], broadcasting over B, T
-            head_representations.append(head_repr)
-
-        # Stack representations: [B, T, num_output_tokens, D]
-        head_stack = torch.stack(head_representations, dim=2)
-
-        # Project all heads to vocabulary in one operation
-        # Reshape: [B*T*num_output_tokens, D] -> [B*T*num_output_tokens, V]
-        B, T, N, D = head_stack.shape
-        head_stack_flat = head_stack.view(B * T * N, D)
-        logits_flat = self.output_proj(head_stack_flat)  # [B*T*N, V]
-
-        # Reshape back: [B, T, num_output_tokens, V]
-        logits = logits_flat.view(B, T, N, self.vocab_size)
-
-        return logits
-
-
 class Model5555LM(nn.Module):
-    """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, num_output_tokens, V]``."""
+    """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``."""
 
     def __init__(self, config: Optional[Config] = None, **overrides):
         super().__init__()
@@ -296,13 +227,10 @@ class Model5555LM(nn.Module):
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
         self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-
-        # Replace single lm_head with SharedMultiTokenHead
-        self.mtp_head = SharedMultiTokenHead(config)
-
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._init_weights)
         if config.tie_word_embeddings:
-            self.mtp_head.output_proj.weight = self.embed_tokens.weight
+            self.lm_head.weight = self.embed_tokens.weight
         residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
         for layer in self.layers:
             nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
@@ -353,11 +281,7 @@ class Model5555LM(nn.Module):
             x = layer(x, attention_mask)
             if output_hidden_states:
                 hidden_states.append(x)
-
-        # Apply final norm and MTP head
-        x = self.final_layernorm(x)
-        logits = self.mtp_head(x)  # [B, T, num_output_tokens, V]
-
+        logits = self.lm_head(self.final_layernorm(x))
         if output_hidden_states:
             return logits, hidden_states
         return logits
@@ -405,7 +329,7 @@ class Model5555LM(nn.Module):
 
     @torch.no_grad()
     def generate(self, text, tokenizer, max_new_tokens=100, temperature=1.0,
-                 top_k=None, top_p=None, eos_token_id=None, do_sample=True, use_mtp=False):
+                 top_k=None, top_p=None, eos_token_id=None, do_sample=True):
         if not isinstance(text, str):
             raise TypeError("text must be a string")
         if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
@@ -441,72 +365,32 @@ class Model5555LM(nn.Module):
         was_training = self.training
         self.eval()
         try:
-            while output_ids.size(1) < max_new_tokens + ids.size(1):
+            for _ in range(max_new_tokens):
                 context = output_ids[:, -self.config.max_seq_len:]
-                logits = self(context)  # [B, T, num_output_tokens, V]
-
-                if use_mtp and self.config.num_output_tokens > 1:
-                    # Use all predicted tokens (MTP mode)
-                    next_tokens_all = []
-                    for token_idx in range(self.config.num_output_tokens):
-                        token_logits = logits[:, -1, token_idx, :]  # [B, V]
-                        if not do_sample:
-                            next_token = token_logits.argmax(dim=-1, keepdim=True)
-                        else:
-                            token_logits_scaled = token_logits / temperature
-                            if top_k is not None:
-                                k = min(top_k, token_logits_scaled.size(-1))
-                                threshold = torch.topk(token_logits_scaled, k, dim=-1).values[:, [-1]]
-                                token_logits_scaled = token_logits_scaled.masked_fill(token_logits_scaled < threshold, float("-inf"))
-                            if top_p is not None and top_p < 1.0:
-                                sorted_logits, sorted_indices = torch.sort(token_logits_scaled, descending=True, dim=-1)
-                                cumulative = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-                                remove = cumulative > top_p
-                                remove[..., 1:] = remove[..., :-1].clone()
-                                remove[..., 0] = False
-                                sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
-                                token_logits_scaled = torch.full_like(token_logits_scaled, float("-inf"))
-                                token_logits_scaled.scatter_(-1, sorted_indices, sorted_logits)
-                            if not torch.isfinite(token_logits_scaled).any(dim=-1).all():
-                                # Fall back to argmax if logits invalid
-                                next_token = token_logits.argmax(dim=-1, keepdim=True)
-                            else:
-                                next_token = torch.multinomial(F.softmax(token_logits_scaled, dim=-1), 1)
-                        next_tokens_all.append(next_token)
-
-                    # Concatenate all tokens from this step
-                    next_tokens = torch.cat(next_tokens_all, dim=1)  # [B, num_output_tokens]
-                    output_ids = torch.cat((output_ids, next_tokens), dim=1)
-
-                    # Check for EOS in any of the predicted tokens
-                    if eos_token_id is not None and (next_tokens == eos_token_id).any():
-                        break
+                logits = self(context)[:, -1, :]
+                if not do_sample:
+                    next_token = logits.argmax(dim=-1, keepdim=True)
                 else:
-                    # Use only first predicted token (standard generation)
-                    token_logits = logits[:, -1, 0, :]  # [B, V]
-                    if not do_sample:
-                        next_token = token_logits.argmax(dim=-1, keepdim=True)
-                    else:
-                        token_logits_scaled = token_logits / temperature
-                        if top_k is not None:
-                            k = min(top_k, token_logits_scaled.size(-1))
-                            threshold = torch.topk(token_logits_scaled, k, dim=-1).values[:, [-1]]
-                            token_logits_scaled = token_logits_scaled.masked_fill(token_logits_scaled < threshold, float("-inf"))
-                        if top_p is not None and top_p < 1.0:
-                            sorted_logits, sorted_indices = torch.sort(token_logits_scaled, descending=True, dim=-1)
-                            cumulative = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-                            remove = cumulative > top_p
-                            remove[..., 1:] = remove[..., :-1].clone()
-                            remove[..., 0] = False
-                            sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
-                            token_logits_scaled = torch.full_like(token_logits_scaled, float("-inf"))
-                            token_logits_scaled.scatter_(-1, sorted_indices, sorted_logits)
-                        if not torch.isfinite(token_logits_scaled).any(dim=-1).all():
-                            raise RuntimeError("model produced no finite logits for sampling")
-                        next_token = torch.multinomial(F.softmax(token_logits_scaled, dim=-1), 1)
-                    output_ids = torch.cat((output_ids, next_token), dim=1)
-                    if eos_token_id is not None and bool((next_token == eos_token_id).all()):
-                        break
+                    logits = logits / temperature
+                    if top_k is not None:
+                        k = min(top_k, logits.size(-1))
+                        threshold = torch.topk(logits, k, dim=-1).values[:, [-1]]
+                        logits = logits.masked_fill(logits < threshold, float("-inf"))
+                    if top_p is not None and top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                        cumulative = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                        remove = cumulative > top_p
+                        remove[..., 1:] = remove[..., :-1].clone()
+                        remove[..., 0] = False
+                        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+                        logits = torch.full_like(logits, float("-inf"))
+                        logits.scatter_(-1, sorted_indices, sorted_logits)
+                    if not torch.isfinite(logits).any(dim=-1).all():
+                        raise RuntimeError("model produced no finite logits for sampling")
+                    next_token = torch.multinomial(F.softmax(logits, dim=-1), 1)
+                output_ids = torch.cat((output_ids, next_token), dim=1)
+                if eos_token_id is not None and bool((next_token == eos_token_id).all()):
+                    break
         finally:
             self.train(was_training)
         return tokenizer.decode(output_ids[0].tolist())
