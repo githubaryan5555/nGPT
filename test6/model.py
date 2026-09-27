@@ -179,6 +179,40 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
+class SparseSwiGLU(nn.Module):
+    """SwiGLU with top-k sparsity to reduce active MLP neurons per token."""
+
+    def __init__(self, config: Config, sparsity_ratio: float = 0.25):
+        super().__init__()
+        if not isinstance(sparsity_ratio, Real) or not math.isfinite(sparsity_ratio):
+            raise ValueError("sparsity_ratio must be a finite real number")
+        if not 0 < sparsity_ratio < 1:
+            raise ValueError("sparsity_ratio must be in the open interval (0, 1)")
+
+        self.intermediate_size = config.intermediate_size
+        self.sparsity_ratio = float(sparsity_ratio)
+        self.k = max(1, int(round(self.intermediate_size * self.sparsity_ratio)))
+
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+
+    def forward(self, x):
+        gate = self.gate_proj(x)
+        gate_active = F.silu(gate)
+        up = self.up_proj(x)
+
+        scores = torch.abs(gate_active)
+        _, topk_idx = torch.topk(scores, self.k, dim=-1, sorted=False)
+
+        sparse_gate = torch.zeros_like(gate_active)
+        sparse_up = torch.zeros_like(up)
+        sparse_gate.scatter_(-1, topk_idx, gate_active.gather(-1, topk_idx))
+        sparse_up.scatter_(-1, topk_idx, up.gather(-1, topk_idx))
+
+        return self.down_proj(sparse_gate * sparse_up)
+
+
 class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -196,7 +230,7 @@ class Block(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = GQAAttention(config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.mlp = SwiGLU(config)
+        self.mlp = SparseSwiGLU(config, sparsity_ratio=0.25)
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, x, attention_mask=None):
