@@ -179,22 +179,6 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
-class SparseSwiGLU(nn.Module):
-    def __init__(self, config: Config, sparsity_ratio: float = 0.25):
-        super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self.dropout_p = sparsity_ratio
-
-    def forward(self, x):
-        gate = F.silu(self.gate_proj(x))
-        up = self.up_proj(x)
-        gate = F.dropout(gate, p=self.dropout_p, training=self.training)
-        up = F.dropout(up, p=self.dropout_p, training=self.training)
-        return self.down_proj(gate * up)
-
-
 class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -212,7 +196,7 @@ class Block(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = GQAAttention(config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.mlp = SparseSwiGLU(config, sparsity_ratio=0.25)
+        self.mlp = SwiGLU(config)
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, x, attention_mask=None):
