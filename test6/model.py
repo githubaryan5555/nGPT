@@ -197,8 +197,9 @@ class Block(nn.Module):
         self.self_attn = GQAAttention(config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.shared_mlp = shared_mlp
-        # Per-layer 16x16 learned matrix before final output projection
-        self.layer_matrix = nn.Parameter(torch.randn(16, 16) * config.initializer_range)
+        # Per-layer learned transformation matrix (hidden_size x hidden_size)
+        # initialized small to act as identity + adaptation
+        self.layer_transform = nn.Parameter(torch.eye(config.hidden_size) * 0.01)
         # Per-layer down projection (intermediate_size -> hidden_size)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
@@ -209,12 +210,12 @@ class Block(nn.Module):
         )
         # Shared MLP (gate + silu + up)
         mlp_out = self.shared_mlp(self.post_attention_layernorm(x))
-        # Apply per-layer learned matrix, then down project
-        mlp_out = torch.matmul(mlp_out, self.layer_matrix.T)
+        # Per-layer down projection
         mlp_out = self.down_proj(mlp_out)
+        # Per-layer learned transformation (lightweight specialization)
+        mlp_out = mlp_out @ self.layer_transform
         x = x + self.hidden_dropout(mlp_out)
         return x
-
 
 class Model5555LM(nn.Module):
     """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``."""
