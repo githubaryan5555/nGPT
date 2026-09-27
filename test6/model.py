@@ -179,20 +179,60 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
-class SwiGLU(nn.Module):
+
+class BlockSparseSwiGLU(nn.Module):
     def __init__(self, config):
         super().__init__()
 
         h = config.hidden_size
         d = config.intermediate_size
 
-        self.in_proj = nn.Linear(h, 2 * d, bias=False)
+        assert d % 8 == 0, "intermediate_size must be divisible by 8"
+
+        self.hidden_size = h
+        self.intermediate_size = d
+
+        self.num_blocks = 8
+        self.active_blocks = 2
+        self.block_size = d // self.num_blocks
+
+        self.gate_proj = nn.Linear(h, d, bias=False)
+        self.up_proj = nn.Linear(h, d, bias=False)
         self.down_proj = nn.Linear(d, h, bias=False)
 
-    def forward(self, x):
-        gate, up = self.in_proj(x).chunk(2, dim=-1)
+        # Chooses which blocks each token uses
+        self.router = nn.Linear(h, self.num_blocks, bias=False)
 
-        return self.down_proj(F.silu(gate) * up)
+    def forward(self, x):
+        # x: [B, T, H]
+
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+
+        hidden = F.silu(gate) * up
+
+        # [B, T, 8]
+        scores = self.router(x)
+
+        # Select exactly 2 blocks per token
+        indices = scores.topk(
+            self.active_blocks,
+            dim=-1
+        ).indices
+
+        # [B, T, 8]
+        mask = torch.zeros_like(scores)
+        mask.scatter_(-1, indices, 1.0)
+
+        # Expand block mask to neurons
+        mask = mask.repeat_interleave(
+            self.block_size,
+            dim=-1
+        )
+
+        hidden = hidden * mask
+
+        return self.down_proj(hidden)
 
 
 
