@@ -178,7 +178,7 @@ class GQAAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(b, t, self.hidden_size)
         return self.o_proj(y)
 
-class SparseSwiGLU(nn.Module):
+class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
 
