@@ -18,8 +18,6 @@
   "max_seq_len": 256,
   "tie_word_embeddings": true,
   "initializer_range": 0.02,
-  "num_output_tokens": 4,
-  "mtp_context_dim": 128,
   "batch_size": 128,
   "gradient_accumulation_steps": 16,
   "max_iters": 1000,
