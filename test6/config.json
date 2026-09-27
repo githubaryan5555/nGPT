@@ -13,7 +13,7 @@
   "attention_dropout": 0.0,
   "hidden_dropout": 0.0,
   "rms_norm_eps": 0.00001,
-  "max_seq_len": 2048,
+  "max_seq_len": 1024,
   "tie_word_embeddings": true,
   "initializer_range": 0.02,
   "batch_size": 128,
