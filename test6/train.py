@@ -132,8 +132,8 @@ batches = TokenBatches()
 def model_values():
     return {name: getattr(cfg, name) for name in (
         "vocab_size", "hidden_size", "num_hidden_layers", "intermediate_size",
-        "num_attention_heads", "attention_dropout",
-        "hidden_dropout", "rms_norm_eps", "tie_word_embeddings",
+        "num_attention_heads", "num_key_value_heads", "attention_dropout",
+        "hidden_dropout", "rms_norm_eps", "rope_theta", "tie_word_embeddings",
         "initializer_range") } | {"max_seq_len": max_seq_len}
 
 
