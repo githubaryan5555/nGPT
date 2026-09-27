@@ -186,22 +186,14 @@ class SwiGLU(nn.Module):
         h = config.hidden_size
         d = config.intermediate_size
 
-        self.gate_proj = nn.Linear(h, d, bias=False)
-        self.up_proj = nn.Linear(h, d, bias=False)
+        self.in_proj = nn.Linear(h, 2 * d, bias=False)
         self.down_proj = nn.Linear(d, h, bias=False)
 
-        self.router = nn.Linear(h, d, bias=False)
-
     def forward(self, x):
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
+        gate, up = self.in_proj(x).chunk(2, dim=-1)
 
-        route = torch.sigmoid(self.router(x))
+        return self.down_proj(F.silu(gate) * up)
 
-        hidden = F.silu(gate) * up
-        hidden = hidden * route
-
-        return self.down_proj(hidden)
 
 
 
