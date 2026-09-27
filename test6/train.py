@@ -86,44 +86,51 @@ if cfg.gradient_accumulation_steps % world_size:
     raise ValueError("gradient_accumulation_steps must be divisible by world size")
 local_grad_accum = cfg.gradient_accumulation_steps // world_size
 max_seq_len = cfg.max_seq_len
+num_output_tokens = cfg.num_output_tokens
 batch_size = cfg.batch_size
 tokens_per_step = cfg.gradient_accumulation_steps * batch_size * max_seq_len
 if master_process:
     os.makedirs(cfg.out_dir, exist_ok=True)
     print(f"device={device}, world_size={world_size}, dtype={dtype_name}")
     print(f"tokens per optimizer step={tokens_per_step:,}")
+    print(f"MTP output tokens={num_output_tokens}")
 
 torch.manual_seed(cfg.seed + rank)
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-# Keep each memmap open and use vectorized windows; this removes the old per-sample
-# Python slicing/astype loop, which was a significant input pipeline bottleneck.
+
+# Each input position receives targets for offsets +1 through +num_output_tokens.
 class TokenBatches:
     def __init__(self):
         self.maps = {}
+        self.window_len = max_seq_len + num_output_tokens
         for split, path in (("train", cfg.train_bin), ("val", cfg.val_bin)):
             if not os.path.isfile(path):
                 raise FileNotFoundError(path)
             data = np.memmap(path, dtype=dataset_dtype, mode="r")
-            if len(data) <= max_seq_len:
-                raise ValueError(f"{path} must contain more than max_seq_len tokens")
+            if len(data) < self.window_len:
+                raise ValueError(f"{path} must contain at least {self.window_len} tokens")
             self.maps[split] = data
 
     def get(self, split):
         data = self.maps[split]
-        starts = torch.randint(0, len(data) - max_seq_len, (batch_size,)).numpy()
-        offsets = np.arange(max_seq_len + 1, dtype=np.int64)
+        starts = torch.randint(0, len(data) - self.window_len + 1, (batch_size,)).numpy()
+        offsets = np.arange(self.window_len, dtype=np.int64)
         windows = np.asarray(data[starts[:, None] + offsets[None, :]], dtype=np.int64)
-        x = torch.from_numpy(windows[:, :-1].copy())
-        y = torch.from_numpy(windows[:, 1:].copy())
+        x = torch.from_numpy(windows[:, :max_seq_len].copy())
+        targets = torch.stack(
+            [torch.from_numpy(windows[:, offset:offset + max_seq_len].copy())
+             for offset in range(1, num_output_tokens + 1)],
+            dim=2,
+        )
         if device_type == "cuda":
             x = x.pin_memory().to(device, non_blocking=True)
-            y = y.pin_memory().to(device, non_blocking=True)
+            targets = targets.pin_memory().to(device, non_blocking=True)
         else:
-            x, y = x.to(device), y.to(device)
-        return x, y
+            x, targets = x.to(device), targets.to(device)
+        return x, targets
 
 
 batches = TokenBatches()
@@ -134,7 +141,7 @@ def model_values():
         "vocab_size", "hidden_size", "num_hidden_layers", "intermediate_size",
         "num_attention_heads", "num_key_value_heads", "attention_dropout",
         "hidden_dropout", "rms_norm_eps", "rope_theta", "tie_word_embeddings",
-        "initializer_range") } | {"max_seq_len": max_seq_len}
+        "initializer_range", "num_output_tokens", "mtp_context_dim") } | {"max_seq_len": max_seq_len}
 
 
 def make_model(values=None):
@@ -204,6 +211,11 @@ raw_model = model.module if ddp else model
 
 
 def language_loss(logits, targets):
+    """Cross-entropy over all MTP offsets; logits/targets are [B, T, N, ...]."""
+    if logits.ndim != 4 or targets.ndim != 3:
+        raise ValueError("MTP logits must be [B, T, N, V] and targets [B, T, N]")
+    if logits.shape[:3] != targets.shape:
+        raise ValueError("MTP logits and targets have incompatible shapes")
     return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
 
@@ -285,8 +297,6 @@ def save_checkpoint(step, val_loss):
     temporary = path + f".tmp.{os.getpid()}"
     torch.save(payload, temporary)
     os.replace(temporary, path)
-    # A stable pointer makes external resume tooling simple while numbered files
-    # remain available for rollback.
     latest = os.path.join(cfg.out_dir, f"{model_name}_latest.pt")
     latest_tmp = latest + f".tmp.{os.getpid()}"
     torch.save(payload, latest_tmp)
@@ -304,7 +314,6 @@ while iter_num < cfg.max_iters:
         group["lr"] = lr
 
     if iter_num % cfg.eval_interval == 0:
-        # This collective must be called by every rank. Only rank zero prints/saves.
         losses = estimate_loss()
         if master_process:
             print(f"step={iter_num:06d} train_loss={losses['train']:.16g} "
@@ -359,7 +368,6 @@ while iter_num < cfg.max_iters:
     iter_num += 1
     local_step += 1
 
-# max_iters is an exclusive update count: max_iters=1000 performs steps 0..999.
 if master_process and cfg.save_checkpoint and iter_num > 0:
     save_checkpoint(iter_num, best_val_loss)
 if ddp:
