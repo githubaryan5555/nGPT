@@ -178,10 +178,7 @@ class GQAAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(b, t, self.hidden_size)
         return self.o_proj(y)
 
-
-
-
-class SwiGLU(nn.Module):
+class SparseSwiGLU(nn.Module):
     def __init__(self, config):
         super().__init__()
 
@@ -192,38 +189,18 @@ class SwiGLU(nn.Module):
         self.active_blocks = 2
 
         assert d % self.num_blocks == 0
-
         self.block_size = d // self.num_blocks
 
-        # Each block owns its own projection.
-        self.gate_proj = nn.ModuleList([
-            nn.Linear(
-                h,
-                self.block_size,
-                bias=False
-            )
-            for _ in range(self.num_blocks)
-        ])
+        self.gate_proj = nn.Linear(
+            h, d, bias=False
+        )
+        self.up_proj = nn.Linear(
+            h, d, bias=False
+        )
+        self.down_proj = nn.Linear(
+            d, h, bias=False
+        )
 
-        self.up_proj = nn.ModuleList([
-            nn.Linear(
-                h,
-                self.block_size,
-                bias=False
-            )
-            for _ in range(self.num_blocks)
-        ])
-
-        self.down_proj = nn.ModuleList([
-            nn.Linear(
-                self.block_size,
-                h,
-                bias=False
-            )
-            for _ in range(self.num_blocks)
-        ])
-
-        # Token -> block
         self.router = nn.Linear(
             h,
             self.num_blocks,
@@ -231,54 +208,46 @@ class SwiGLU(nn.Module):
         )
 
     def forward(self, x):
-
         B, T, H = x.shape
 
-        # [B,T,8]
-        scores = self.router(x)
+        # ---------------------------------------
+        # Choose 2 of 8 blocks for each token
+        # ---------------------------------------
 
-        # [B,T,2]
+        scores = self.router(x)  # [B,T,8]
+
         selected = scores.topk(
             self.active_blocks,
             dim=-1
         ).indices
 
-        output = torch.zeros_like(x)
+        mask = torch.zeros_like(scores)
 
-        # -------------------------------------------------
-        # Process each block only for tokens that selected it
-        # -------------------------------------------------
+        mask.scatter_(
+            -1,
+            selected,
+            1.0
+        )
 
-        for block_idx in range(self.num_blocks):
+        # [B,T,8] -> [B,T,D]
+        mask = mask.repeat_interleave(
+            self.block_size,
+            dim=-1
+        )
 
-            token_mask = (
-                selected == block_idx
-            ).any(dim=-1)
+        # ---------------------------------------
+        # SwiGLU
+        # ---------------------------------------
 
-            if not token_mask.any():
-                continue
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
 
-            # Flatten selected tokens
-            x_selected = x[token_mask]
+        hidden = F.silu(gate) * up
 
-            gate = self.gate_proj[block_idx](
-                x_selected
-            )
+        # Keep only 2/8 blocks
+        hidden = hidden * mask
 
-            up = self.up_proj[block_idx](
-                x_selected
-            )
-
-            hidden = F.silu(gate) * up
-
-            contribution = self.down_proj[block_idx](
-                hidden
-            )
-
-            output[token_mask] += contribution
-
-        return output
-
+        return self.down_proj(hidden)
 
 
 
