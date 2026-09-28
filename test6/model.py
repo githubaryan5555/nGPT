@@ -179,27 +179,34 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 class SwiGLU(nn.Module):
-    def __init__(self, config, gate_rank=512):
+    def __init__(self, config, gated_ratio=0.5):
         super().__init__()
 
         d = config.hidden_size
         m = config.intermediate_size
 
-        self.up_proj = nn.Linear(d, m, bias=False)
+        mg = int(m * gated_ratio)
+        mu = m - mg
 
-        self.gate_down = nn.Linear(d, gate_rank, bias=False)
-        self.gate_up = nn.Linear(gate_rank, m, bias=False)
+        self.gate = nn.Linear(d, mg, bias=False)
+        self.gated_up = nn.Linear(d, mg, bias=False)
 
-        self.down_proj = nn.Linear(m, d, bias=False)
+        self.normal_up = nn.Linear(d, mu, bias=False)
+
+        self.down = nn.Linear(m, d, bias=False)
 
     def forward(self, x):
-        h = self.up_proj(x)
-
-        gate = self.gate_up(
-            F.silu(self.gate_down(x))
+        gated = (
+            F.silu(self.gate(x))
+            * self.gated_up(x)
         )
 
-        return self.down_proj(h * gate)
+        normal = self.normal_up(x)
+
+        h = torch.cat([gated, normal], dim=-1)
+
+        return self.down(h)
+
 
 
 class Block(nn.Module):
