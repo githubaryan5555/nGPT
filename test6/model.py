@@ -179,131 +179,27 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 class SwiGLU(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config, gate_rank=512):
         super().__init__()
 
-        h = config.hidden_size
-        d = config.intermediate_size
+        d = config.hidden_size
+        m = config.intermediate_size
 
-        assert d % 8 == 0, \
-            "intermediate_size must be divisible by 8"
+        self.up_proj = nn.Linear(d, m, bias=False)
 
-        self.num_blocks = 8
-        self.active_blocks = 2
-        self.block_size = d // self.num_blocks
+        self.gate_down = nn.Linear(d, gate_rank, bias=False)
+        self.gate_up = nn.Linear(gate_rank, m, bias=False)
 
-        self.gate_proj = nn.Linear(
-            h, d, bias=False
-        )
-
-        self.up_proj = nn.Linear(
-            h, d, bias=False
-        )
-
-        self.down_proj = nn.Linear(
-            d, h, bias=False
-        )
-
-        self.router = nn.Linear(
-            h,
-            self.num_blocks,
-            bias=False
-        )
+        self.down_proj = nn.Linear(m, d, bias=False)
 
     def forward(self, x):
-        B, T, H = x.shape
+        h = self.up_proj(x)
 
-        # -----------------------------------------
-        # Router
-        # -----------------------------------------
-
-        scores = self.router(x)
-
-        selected = scores.topk(
-            self.active_blocks,
-            dim=-1
-        ).indices
-
-        # -----------------------------------------
-        # Flatten tokens
-        # -----------------------------------------
-
-        x_flat = x.reshape(-1, H)
-        selected_flat = selected.reshape(-1, self.active_blocks)
-
-        N = x_flat.shape[0]
-
-        # -----------------------------------------
-        # Weight blocks
-        # -----------------------------------------
-
-        gate_weight = self.gate_proj.weight.reshape(
-            self.num_blocks,
-            self.block_size,
-            H
+        gate = self.gate_up(
+            F.silu(self.gate_down(x))
         )
 
-        up_weight = self.up_proj.weight.reshape(
-            self.num_blocks,
-            self.block_size,
-            H
-        )
-
-        # -----------------------------------------
-        # Sparse intermediate
-        # -----------------------------------------
-
-        hidden = torch.zeros(
-            N,
-            self.intermediate_size,
-            device=x.device,
-            dtype=x.dtype
-        )
-
-        # -----------------------------------------
-        # Only calculate selected blocks
-        # -----------------------------------------
-
-        for block_idx in range(self.num_blocks):
-
-            token_mask = (
-                selected_flat == block_idx
-            ).any(dim=-1)
-
-            if not token_mask.any():
-                continue
-
-            xb = x_flat[token_mask]
-
-            gate = F.linear(
-                xb,
-                gate_weight[block_idx]
-            )
-
-            up = F.linear(
-                xb,
-                up_weight[block_idx]
-            )
-
-            hb = F.silu(gate) * up
-
-            start = block_idx * self.block_size
-            end = start + self.block_size
-
-            hidden[token_mask, start:end] = (
-                hb.to(hidden.dtype)
-            )
-
-        # -----------------------------------------
-        # Down projection
-        # -----------------------------------------
-
-        output = F.linear(
-            hidden,
-            self.down_proj.weight
-        )
-
-        return output.reshape(B, T, H)
+        return self.down_proj(h * gate)
 
 
 class Block(nn.Module):
