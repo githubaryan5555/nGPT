@@ -179,71 +179,35 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
-class SharedSwiGLUGate(nn.Module):
+class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.gate_proj = nn.Linear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=False,
-        )
-        self.norm = RMSNorm(
-            config.intermediate_size,
-            config.rms_norm_eps,
-        )
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        return F.silu(self.norm(self.gate_proj(x)))
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
-
-class SwiGLU(nn.Module):
-    def __init__(self, config: Config, shared_gate: nn.Module):
-        super().__init__()
-        self.shared_gate = shared_gate
-        self.up_proj = nn.Linear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=False,
-        )
-        self.down_proj = nn.Linear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-        )
-
-    def forward(self, x):
-        gate = self.shared_gate(x)
-        up = self.up_proj(x)
-        return self.down_proj(gate * up)
 
 class Block(nn.Module):
-    def __init__(self, config: Config, shared_gate: nn.Module):
+    def __init__(self, config: Config):
         super().__init__()
-        self.input_layernorm = RMSNorm(
-            config.hidden_size,
-            config.rms_norm_eps,
-        )
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = GQAAttention(config)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size,
-            config.rms_norm_eps,
-        )
-        self.mlp = SwiGLU(config, shared_gate)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.mlp = SwiGLU(config)
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, x, attention_mask=None):
         x = x + self.hidden_dropout(
-            self.self_attn(
-                self.input_layernorm(x),
-                attention_mask,
-            )
+            self.self_attn(self.input_layernorm(x), attention_mask)
         )
         x = x + self.hidden_dropout(
-            self.mlp(
-                self.post_attention_layernorm(x)
-            )
+            self.mlp(self.post_attention_layernorm(x))
         )
         return x
+
 
 class Model5555LM(nn.Module):
     """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``."""
@@ -261,15 +225,7 @@ class Model5555LM(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
-
-        self.shared_swiglu_gate = SharedSwiGLUGate(config)
-
-        self.layers = nn.ModuleList(
-            Block(config, self.shared_swiglu_gate)
-            for _ in range(config.num_hidden_layers)
-        )
-
-        
+        self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._init_weights)
