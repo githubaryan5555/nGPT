@@ -182,35 +182,13 @@ class GQAAttention(nn.Module):
 class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-
-        bottleneck = 64
-
-        self.gate_down = nn.Linear(
-            config.hidden_size,
-            bottleneck,
-            bias=False,
-        )
-        self.gate_up = nn.Linear(
-            bottleneck,
-            config.intermediate_size,
-            bias=False,
-        )
-
-        self.up_proj = nn.Linear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=False,
-        )
-        self.down_proj = nn.Linear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-        )
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        gate = F.silu(self.gate_up(self.gate_down(x)))
-        up = self.up_proj(x)
-        return self.down_proj(gate * up)
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
 
 class Block(nn.Module):
     def __init__(self, config: Config):
