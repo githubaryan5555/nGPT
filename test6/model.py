@@ -179,7 +179,7 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
-class GroupedSwiGLU(nn.Module):
+class SwiGLU(nn.Module):
     def __init__(self, config, groups=4):
         super().__init__()
 
