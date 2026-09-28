@@ -178,29 +178,146 @@ class GQAAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(b, t, self.hidden_size)
         return self.o_proj(y)
 
-class SwiGLU(nn.Module):
-    def __init__(self, config):
+
+class GroupedSwiGLU(nn.Module):
+    def __init__(self, config, groups=4):
         super().__init__()
 
         d = config.hidden_size
         m = config.intermediate_size
 
-        self.proj = nn.Linear(d, m, bias=False)
+        assert d % groups == 0
+        assert m % groups == 0
 
-        self.gate_scale = nn.Parameter(torch.ones(m))
-        self.gate_bias = nn.Parameter(torch.zeros(m))
+        self.groups = groups
 
-        self.down_proj = nn.Linear(m, d, bias=False)
+        dg = d // groups
+        mg = m // groups
 
-    def forward(self, x):
-        h = self.proj(x)
+        self.dg = dg
+        self.mg = mg
+        self.d = d
+        self.m = m
 
-        gate = torch.sigmoid(
-            h * self.gate_scale + self.gate_bias
+        self.gate_weight = nn.Parameter(
+            torch.empty(groups, dg, mg)
         )
 
-        return self.down_proj(h * gate)
+        self.up_weight = nn.Parameter(
+            torch.empty(groups, dg, mg)
+        )
 
+        self.down_proj = nn.Linear(
+            m,
+            d,
+            bias=False
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.normal_(
+            self.gate_weight,
+            mean=0.0,
+            std=0.02
+        )
+
+        nn.init.normal_(
+            self.up_weight,
+            mean=0.0,
+            std=0.02
+        )
+
+    def forward(self, x):
+
+        B, T, D = x.shape
+
+        G = self.groups
+        dg = self.dg
+        mg = self.mg
+
+        # -----------------------------------------------
+        # [B,T,D]
+        #       ↓
+        # [B*T,G,dg]
+        # -----------------------------------------------
+
+        x = x.reshape(
+            B * T,
+            G,
+            dg
+        )
+
+        # -----------------------------------------------
+        # Batched GEMM
+        #
+        # x:
+        #   [BT,G,dg]
+        #
+        # weight:
+        #   [G,dg,mg]
+        #
+        # Unfortunately torch.bmm requires the batch
+        # dimension to be first, so flatten BT and G.
+        # -----------------------------------------------
+
+        x = x.transpose(0, 1)
+        # [G, BT, dg]
+
+        x = x.reshape(
+            G,
+            B * T,
+            dg
+        )
+
+        gate_w = self.gate_weight
+        up_w = self.up_weight
+
+        gate = torch.bmm(
+            x,
+            gate_w
+        )
+
+        up = torch.bmm(
+            x,
+            up_w
+        )
+
+        # [G,BT,mg]
+        gate = F.silu(gate)
+
+        hidden = gate * up
+
+        # -----------------------------------------------
+        # [G,BT,mg]
+        #       ↓
+        # [BT,G,mg]
+        #       ↓
+        # [BT,M]
+        # -----------------------------------------------
+
+        hidden = hidden.reshape(
+            G,
+            B * T,
+            mg
+        )
+
+        hidden = hidden.permute(
+            1,
+            0,
+            2
+        ).reshape(
+            B * T,
+            G * mg
+        )
+
+        # -----------------------------------------------
+        # Output projection
+        # -----------------------------------------------
+
+        output = self.down_proj(hidden)
+
+        return output.reshape(B, T, D)
 
 
 
