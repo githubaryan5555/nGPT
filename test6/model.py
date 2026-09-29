@@ -399,19 +399,20 @@ class SwiGLU(nn.Module):
 
 
 class Block(nn.Module):
+class Block(nn.Module):
     """
-    Parallel Attention + MLP block using two CUDA streams.
+    Parallel Attention + MLP block using explicit CUDA streams.
 
-    The 8 blocks themselves remain sequential.
+    The 8 blocks remain sequential.
 
     Inside each block:
 
         x
-        ├── RMSNorm -> Attention ──┐
-        │                          │
-        └── RMSNorm -> MLP ────────┤
-                                   ↓
-                              residual add
+        ├── Attention ──┐
+        │               │
+        └── MLP ────────┤
+                        ↓
+                    residual add
     """
 
     def __init__(self, config: Config):
@@ -435,68 +436,86 @@ class Block(nn.Module):
             config.hidden_dropout
         )
 
-        self.use_cuda_streams = torch.cuda.is_available()
-
-        if self.use_cuda_streams:
+        if torch.cuda.is_available():
             self.attn_stream = torch.cuda.Stream()
             self.mlp_stream = torch.cuda.Stream()
 
-    def forward(self, x, attention_mask=None):
+    @torch.compiler.disable
+    def _parallel_cuda_forward(
+        self,
+        x,
+        attn_input,
+        mlp_input,
+        attention_mask,
+    ):
+        current_stream = torch.cuda.current_stream(
+            device=x.device
+        )
 
-        if (
-            not self.use_cuda_streams
-            or not x.is_cuda
-        ):
-            attn_input = self.input_layernorm(x)
-            mlp_input = self.post_attention_layernorm(x)
+        attn_stream = self.attn_stream
+        mlp_stream = self.mlp_stream
 
-            attn_output = self.self_attn(
-                attn_input,
-                attention_mask,
-            )
+        # Make worker streams wait until x and both
+        # normalized inputs are ready.
 
-            mlp_output = self.mlp(mlp_input)
-
-            x = x + self.hidden_dropout(attn_output)
-            x = x + self.hidden_dropout(mlp_output)
-
-            return x
-
-        current_stream = torch.cuda.current_stream(x.device)
-
-        # Both normalization operations are done first
-        # on the current stream so both branches have
-        # completely independent inputs.
-
-        attn_input = self.input_layernorm(x)
-        mlp_input = self.post_attention_layernorm(x)
-
-        # Make both worker streams wait until the normalized
-        # inputs and attention mask are ready.
-
-        self.attn_stream.wait_stream(current_stream)
-        self.mlp_stream.wait_stream(current_stream)
+        attn_stream.wait_stream(current_stream)
+        mlp_stream.wait_stream(current_stream)
 
         # Attention branch.
-        with torch.cuda.stream(self.attn_stream):
+        with torch.cuda.stream(attn_stream):
             attn_output = self.self_attn(
                 attn_input,
                 attention_mask,
             )
 
         # MLP branch.
-        with torch.cuda.stream(self.mlp_stream):
-            mlp_output = self.mlp(mlp_input)
+        with torch.cuda.stream(mlp_stream):
+            mlp_output = self.mlp(
+                mlp_input
+            )
 
         # Main stream waits for both branches.
+        current_stream.wait_stream(attn_stream)
+        current_stream.wait_stream(mlp_stream)
 
-        current_stream.wait_stream(self.attn_stream)
-        current_stream.wait_stream(self.mlp_stream)
+        return attn_output, mlp_output
 
-        # Both outputs are now guaranteed to be complete.
+    def forward(self, x, attention_mask=None):
 
-        x = x + self.hidden_dropout(attn_output)
-        x = x + self.hidden_dropout(mlp_output)
+        # Both branches receive the SAME incoming
+        # residual stream.
+
+        attn_input = self.input_layernorm(x)
+        mlp_input = self.post_attention_layernorm(x)
+
+        if x.is_cuda and torch.cuda.is_available():
+
+            attn_output, mlp_output = (
+                self._parallel_cuda_forward(
+                    x,
+                    attn_input,
+                    mlp_input,
+                    attention_mask,
+                )
+            )
+
+        else:
+            attn_output = self.self_attn(
+                attn_input,
+                attention_mask,
+            )
+
+            mlp_output = self.mlp(
+                mlp_input
+            )
+
+        x = x + self.hidden_dropout(
+            attn_output
+        )
+
+        x = x + self.hidden_dropout(
+            mlp_output
+        )
 
         return x
 
