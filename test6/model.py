@@ -44,8 +44,10 @@ class Config:
 
         for name in integer_fields:
             value = getattr(self, name)
+
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be an int")
+
             if value <= 0:
                 raise ValueError(f"{name} must be > 0")
 
@@ -78,18 +80,22 @@ class Config:
             "initializer_range",
         ):
             value = getattr(self, name)
+
             if (
                 not isinstance(value, Real)
                 or not math.isfinite(value)
                 or value <= 0
             ):
-                raise ValueError(f"{name} must be finite and > 0")
+                raise ValueError(
+                    f"{name} must be finite and > 0"
+                )
 
         for name in (
             "attention_dropout",
             "hidden_dropout",
         ):
             value = getattr(self, name)
+
             if (
                 not isinstance(value, Real)
                 or not math.isfinite(value)
@@ -100,7 +106,9 @@ class Config:
                 )
 
         if not isinstance(self.tie_word_embeddings, bool):
-            raise TypeError("tie_word_embeddings must be a bool")
+            raise TypeError(
+                "tie_word_embeddings must be a bool"
+            )
 
     @property
     def head_dim(self):
@@ -114,6 +122,7 @@ class Config:
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float):
         super().__init__()
+
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
@@ -399,20 +408,20 @@ class SwiGLU(nn.Module):
 
 
 class Block(nn.Module):
-class Block(nn.Module):
     """
-    Parallel Attention + MLP block using explicit CUDA streams.
+    Parallel Attention + MLP block.
 
-    The 8 blocks remain sequential.
+    The blocks themselves remain sequential:
+
+        Block 1 -> Block 2 -> ... -> Block N
 
     Inside each block:
 
-        x
-        ├── Attention ──┐
-        │               │
-        └── MLP ────────┤
-                        ↓
-                    residual add
+                    ┌── Attention ──┐
+        x ──────────┤               ├── residual add
+                    └──── MLP ──────┘
+
+    Attention and MLP receive the same block input.
     """
 
     def __init__(self, config: Config):
@@ -436,92 +445,78 @@ class Block(nn.Module):
             config.hidden_dropout
         )
 
-        if torch.cuda.is_available():
+        self.use_cuda_streams = torch.cuda.is_available()
+
+        if self.use_cuda_streams:
             self.attn_stream = torch.cuda.Stream()
             self.mlp_stream = torch.cuda.Stream()
 
-    @torch.compiler.disable
-    def _parallel_cuda_forward(
-        self,
-        x,
-        attn_input,
-        mlp_input,
-        attention_mask,
-    ):
+    @torch._dynamo.disable
+    def forward(self, x, attention_mask=None):
+        if not self.use_cuda_streams or not x.is_cuda:
+            attn_input = self.input_layernorm(x)
+            mlp_input = self.post_attention_layernorm(x)
+
+            attn_output = self.self_attn(
+                attn_input,
+                attention_mask,
+            )
+
+            mlp_output = self.mlp(mlp_input)
+
+            x = x + self.hidden_dropout(attn_output)
+            x = x + self.hidden_dropout(mlp_output)
+
+            return x
+
         current_stream = torch.cuda.current_stream(
             device=x.device
         )
 
-        attn_stream = self.attn_stream
-        mlp_stream = self.mlp_stream
-
-        # Make worker streams wait until x and both
-        # normalized inputs are ready.
-
-        attn_stream.wait_stream(current_stream)
-        mlp_stream.wait_stream(current_stream)
-
-        # Attention branch.
-        with torch.cuda.stream(attn_stream):
-            attn_output = self.self_attn(
-                attn_input,
-                attention_mask,
-            )
-
-        # MLP branch.
-        with torch.cuda.stream(mlp_stream):
-            mlp_output = self.mlp(
-                mlp_input
-            )
-
-        # Main stream waits for both branches.
-        current_stream.wait_stream(attn_stream)
-        current_stream.wait_stream(mlp_stream)
-
-        return attn_output, mlp_output
-
-    def forward(self, x, attention_mask=None):
-
-        # Both branches receive the SAME incoming
-        # residual stream.
+        # Both inputs are prepared before either worker
+        # stream starts. This guarantees both branches
+        # consume the same incoming residual stream.
 
         attn_input = self.input_layernorm(x)
         mlp_input = self.post_attention_layernorm(x)
 
-        if x.is_cuda and torch.cuda.is_available():
+        # Ensure both worker streams wait until the
+        # inputs have been produced on the main stream.
 
-            attn_output, mlp_output = (
-                self._parallel_cuda_forward(
-                    x,
-                    attn_input,
-                    mlp_input,
-                    attention_mask,
-                )
-            )
+        self.attn_stream.wait_stream(current_stream)
+        self.mlp_stream.wait_stream(current_stream)
 
-        else:
+        # Attention runs on its own CUDA stream.
+
+        with torch.cuda.stream(self.attn_stream):
             attn_output = self.self_attn(
                 attn_input,
                 attention_mask,
             )
 
-            mlp_output = self.mlp(
-                mlp_input
-            )
+        # MLP runs on a different CUDA stream.
 
-        x = x + self.hidden_dropout(
-            attn_output
-        )
+        with torch.cuda.stream(self.mlp_stream):
+            mlp_output = self.mlp(mlp_input)
 
-        x = x + self.hidden_dropout(
-            mlp_output
-        )
+        # The main stream waits for both branches.
+
+        current_stream.wait_stream(self.attn_stream)
+        current_stream.wait_stream(self.mlp_stream)
+
+        # Both results are now guaranteed to be ready.
+
+        x = x + self.hidden_dropout(attn_output)
+        x = x + self.hidden_dropout(mlp_output)
 
         return x
 
 
 class Model5555LM(nn.Module):
-    """Causal language model with input/output shapes [B, T] and [B, T, V]."""
+    """
+    Causal language model with input/output shapes
+    [B, T] and [B, T, V].
+    """
 
     def __init__(
         self,
@@ -700,7 +695,9 @@ class Model5555LM(nn.Module):
             self.embed_tokens(input_ids)
         )
 
-        hidden_states = [] if output_hidden_states else None
+        hidden_states = (
+            [] if output_hidden_states else None
+        )
 
         for layer in self.layers:
             x = layer(
@@ -760,7 +757,9 @@ class Model5555LM(nn.Module):
             isinstance(seq_len, bool)
             or not isinstance(seq_len, int)
         ):
-            raise TypeError("seq_len must be an int")
+            raise TypeError(
+                "seq_len must be an int"
+            )
 
         if not 0 < seq_len <= self.config.max_seq_len:
             raise ValueError(
@@ -1001,7 +1000,8 @@ class Model5555LM(nn.Module):
                         remove = cumulative > top_p
 
                         remove[..., 1:] = (
-                            remove[..., :-1].clone()
+                            remove[..., :-1]
+                            .clone()
                         )
 
                         remove[..., 0] = False
