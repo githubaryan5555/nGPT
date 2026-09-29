@@ -33,9 +33,13 @@ class Config:
 
     def __post_init__(self):
         integer_fields = (
-            "vocab_size", "hidden_size", "num_hidden_layers",
-            "intermediate_size", "num_attention_heads",
-            "num_key_value_heads", "max_seq_len",
+            "vocab_size",
+            "hidden_size",
+            "num_hidden_layers",
+            "intermediate_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "max_seq_len",
         )
 
         for name in integer_fields:
@@ -96,9 +100,7 @@ class Config:
                 )
 
         if not isinstance(self.tie_word_embeddings, bool):
-            raise TypeError(
-                "tie_word_embeddings must be a bool"
-            )
+            raise TypeError("tie_word_embeddings must be a bool")
 
     @property
     def head_dim(self):
@@ -398,15 +400,18 @@ class SwiGLU(nn.Module):
 
 class Block(nn.Module):
     """
-    Parallel attention + MLP block.
+    Parallel Attention + MLP block using two CUDA streams.
 
-    Original:
-        x -> Attention -> residual -> MLP -> residual
+    The 8 blocks themselves remain sequential.
 
-    New:
-        x -> Attention ─────┐
-        x -> MLP ───────────┤
-                            └-> residual additions
+    Inside each block:
+
+        x
+        ├── RMSNorm -> Attention ──┐
+        │                          │
+        └── RMSNorm -> MLP ────────┤
+                                   ↓
+                              residual add
     """
 
     def __init__(self, config: Config):
@@ -430,27 +435,65 @@ class Block(nn.Module):
             config.hidden_dropout
         )
 
+        self.use_cuda_streams = torch.cuda.is_available()
+
+        if self.use_cuda_streams:
+            self.attn_stream = torch.cuda.Stream()
+            self.mlp_stream = torch.cuda.Stream()
+
     def forward(self, x, attention_mask=None):
-        # Both branches start from the SAME input x.
-        #
-        # Branch 1:
-        # x -> RMSNorm -> Attention
-        #
-        # Branch 2:
-        # x -> RMSNorm -> MLP
-        #
-        # They can therefore be scheduled independently
-        # by the GPU/compiler.
+
+        if (
+            not self.use_cuda_streams
+            or not x.is_cuda
+        ):
+            attn_input = self.input_layernorm(x)
+            mlp_input = self.post_attention_layernorm(x)
+
+            attn_output = self.self_attn(
+                attn_input,
+                attention_mask,
+            )
+
+            mlp_output = self.mlp(mlp_input)
+
+            x = x + self.hidden_dropout(attn_output)
+            x = x + self.hidden_dropout(mlp_output)
+
+            return x
+
+        current_stream = torch.cuda.current_stream(x.device)
+
+        # Both normalization operations are done first
+        # on the current stream so both branches have
+        # completely independent inputs.
 
         attn_input = self.input_layernorm(x)
         mlp_input = self.post_attention_layernorm(x)
 
-        attn_output = self.self_attn(
-            attn_input,
-            attention_mask,
-        )
+        # Make both worker streams wait until the normalized
+        # inputs and attention mask are ready.
 
-        mlp_output = self.mlp(mlp_input)
+        self.attn_stream.wait_stream(current_stream)
+        self.mlp_stream.wait_stream(current_stream)
+
+        # Attention branch.
+        with torch.cuda.stream(self.attn_stream):
+            attn_output = self.self_attn(
+                attn_input,
+                attention_mask,
+            )
+
+        # MLP branch.
+        with torch.cuda.stream(self.mlp_stream):
+            mlp_output = self.mlp(mlp_input)
+
+        # Main stream waits for both branches.
+
+        current_stream.wait_stream(self.attn_stream)
+        current_stream.wait_stream(self.mlp_stream)
+
+        # Both outputs are now guaranteed to be complete.
 
         x = x + self.hidden_dropout(attn_output)
         x = x + self.hidden_dropout(mlp_output)
@@ -459,10 +502,7 @@ class Block(nn.Module):
 
 
 class Model5555LM(nn.Module):
-    """
-    Causal language model with input/output shapes
-    [B, T] and [B, T, V].
-    """
+    """Causal language model with input/output shapes [B, T] and [B, T, V]."""
 
     def __init__(
         self,
@@ -583,8 +623,8 @@ class Model5555LM(nn.Module):
 
         if t > self.config.max_seq_len:
             raise ValueError(
-                f"sequence length {t} exceeds "
-                f"max_seq_len {self.config.max_seq_len}"
+                f"sequence length {t} exceeds max_seq_len "
+                f"{self.config.max_seq_len}"
             )
 
         if attention_mask is not None:
@@ -604,8 +644,8 @@ class Model5555LM(nn.Module):
 
             if attention_mask.device != input_ids.device:
                 raise ValueError(
-                    "attention_mask and input_ids must "
-                    "be on the same device"
+                    "attention_mask and input_ids must be "
+                    "on the same device"
                 )
 
             if attention_mask.dtype == torch.bool:
@@ -625,8 +665,7 @@ class Model5555LM(nn.Module):
 
             else:
                 raise TypeError(
-                    "attention_mask must be boolean "
-                    "or numeric"
+                    "attention_mask must be boolean or numeric"
                 )
 
         if (
@@ -642,18 +681,7 @@ class Model5555LM(nn.Module):
             self.embed_tokens(input_ids)
         )
 
-        hidden_states = (
-            [] if output_hidden_states else None
-        )
-
-        # The 8 blocks are STILL sequential.
-        #
-        # Block 1 output -> Block 2 input
-        # Block 2 output -> Block 3 input
-        # ...
-        #
-        # Only Attention and MLP INSIDE each block
-        # are independent.
+        hidden_states = [] if output_hidden_states else None
 
         for layer in self.layers:
             x = layer(
@@ -713,9 +741,7 @@ class Model5555LM(nn.Module):
             isinstance(seq_len, bool)
             or not isinstance(seq_len, int)
         ):
-            raise TypeError(
-                "seq_len must be an int"
-            )
+            raise TypeError("seq_len must be an int")
 
         if not 0 < seq_len <= self.config.max_seq_len:
             raise ValueError(
@@ -956,8 +982,7 @@ class Model5555LM(nn.Module):
                         remove = cumulative > top_p
 
                         remove[..., 1:] = (
-                            remove[..., :-1]
-                            .clone()
+                            remove[..., :-1].clone()
                         )
 
                         remove[..., 0] = False
