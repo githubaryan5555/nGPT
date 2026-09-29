@@ -194,6 +194,9 @@ class SwiGLU(nn.Module):
         )
 
     def forward(self, x):
+        return self.down_proj(F.relu(self.up_proj(x)))
+
+    def forward(self, x):
         return self.down_proj(F.gelu(self.up_proj(x)))
 
 class Block(nn.Module):
