@@ -1,366 +1,396 @@
-"""DDP-capable trainer for Model5555LM.
+"""Small decoder-only language model used by ``train.py``."""
 
-The binary files are already tokenized. Configuration is loaded by config.py from
-config.json, while command-line ``--name=value`` arguments can override it.
-"""
-
-import argparse
-import glob
-import json
+from dataclasses import asdict, dataclass
 import math
-import os
-import re
-import time
-from contextlib import nullcontext
+from numbers import Real
+from typing import Optional
 
-import numpy as np
 import torch
-import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 
-import config as cfg
-from model import Config, Model5555LM
-
-
-def apply_cli():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--eval_only", action="store_true")
-    args, unknown = parser.parse_known_args()
-    aliases = {"compile": "compile_model", "decay_lr": "lr_decay"}
-    for item in unknown:
-        if not item.startswith("--") or "=" not in item:
-            continue
-        name, value = item[2:].split("=", 1)
-        name = aliases.get(name, name)
-        if not hasattr(cfg, name):
-            continue
-        old = getattr(cfg, name)
-        if isinstance(old, bool):
-            value = value.lower() in {"1", "true", "yes", "on"}
-        elif isinstance(old, int) and not isinstance(old, bool):
-            value = int(value)
-        elif isinstance(old, float):
-            value = float(value)
-        elif value.lower() == "none":
-            value = None
-        setattr(cfg, name, value)
-    if args.resume:
-        cfg.init_from = "resume"
-    if args.eval_only:
-        cfg.eval_only = True
+try:
+    from . import config as cfg
+except ImportError:  # Support running ``python test4/model.py`` directly.
+    import config as cfg
 
 
-apply_cli()
-model_name = cfg.model_name
-dataset_dtype = np.dtype(cfg.dataset_dtype)
-if dataset_dtype.kind not in "iu":
-    raise ValueError("dataset_dtype must be an integer NumPy dtype")
+@dataclass
+class Config:
+    vocab_size: int = cfg.vocab_size
+    hidden_size: int = cfg.hidden_size
+    num_hidden_layers: int = cfg.num_hidden_layers
+    intermediate_size: int = cfg.intermediate_size
+    num_attention_heads: int = cfg.num_attention_heads
+    num_key_value_heads: int = cfg.num_key_value_heads
+    attention_dropout: float = cfg.attention_dropout
+    hidden_dropout: float = cfg.hidden_dropout
+    rms_norm_eps: float = cfg.rms_norm_eps
+    rope_theta: float = cfg.rope_theta
+    max_seq_len: int = cfg.max_seq_len
+    tie_word_embeddings: bool = cfg.tie_word_embeddings
+    initializer_range: float = cfg.initializer_range
 
-# DDP is initialized before any device-dependent work.
-ddp = int(os.environ.get("RANK", -1)) >= 0
-if ddp:
-    dist.init_process_group(backend=cfg.backend)
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    device = f"cuda:{local_rank}"
-    torch.cuda.set_device(device)
-else:
-    rank, local_rank, world_size = 0, 0, 1
-    device = cfg.device
-master_process = rank == 0
-if "cuda" in device and not torch.cuda.is_available():
-    raise RuntimeError("CUDA was requested but is unavailable")
-device_type = "cuda" if "cuda" in device else "cpu"
-if device_type == "cpu" and cfg.dtype != "float32":
-    dtype_name = "float32"
-else:
-    dtype_name = cfg.dtype
-ptdtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
-ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type="cuda", dtype=ptdtype)
-scaler = torch.amp.GradScaler("cuda", enabled=device_type == "cuda" and dtype_name == "float16")
+    def __post_init__(self):
+        integer_fields = (
+            "vocab_size", "hidden_size", "num_hidden_layers",
+            "intermediate_size", "num_attention_heads",
+            "num_key_value_heads", "max_seq_len",
+        )
+        for name in integer_fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an int")
+            if value <= 0:
+                raise ValueError(f"{name} must be > 0")
 
-if cfg.gradient_accumulation_steps % world_size:
-    raise ValueError("gradient_accumulation_steps must be divisible by world size")
-local_grad_accum = cfg.gradient_accumulation_steps // world_size
-max_seq_len = cfg.max_seq_len
-batch_size = cfg.batch_size
-tokens_per_step = cfg.gradient_accumulation_steps * batch_size * max_seq_len
-if master_process:
-    os.makedirs(cfg.out_dir, exist_ok=True)
-    print(f"device={device}, world_size={world_size}, dtype={dtype_name}")
-    print(f"tokens per optimizer step={tokens_per_step:,}")
+        if self.hidden_size % self.num_attention_heads:
+            raise ValueError("hidden_size must be divisible by num_attention_heads")
+        if self.num_attention_heads % self.num_key_value_heads:
+            raise ValueError(
+                "num_attention_heads must be divisible by num_key_value_heads"
+            )
+        if self.num_key_value_heads > self.num_attention_heads:
+            raise ValueError("num_key_value_heads must be <= num_attention_heads")
+        if self.head_dim % 2:
+            raise ValueError("head_dim must be even for RoPE")
+        if self.intermediate_size <= self.hidden_size:
+            raise ValueError("intermediate_size must be greater than hidden_size")
 
-torch.manual_seed(cfg.seed + rank)
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+        for name in ("rms_norm_eps", "rope_theta", "initializer_range"):
+            value = getattr(self, name)
+            if not isinstance(value, Real) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and > 0")
+        for name in ("attention_dropout", "hidden_dropout"):
+            value = getattr(self, name)
+            if not isinstance(value, Real) or not math.isfinite(value) or not 0 <= value < 1:
+                raise ValueError(f"{name} must be finite and in [0, 1)")
+        if not isinstance(self.tie_word_embeddings, bool):
+            raise TypeError("tie_word_embeddings must be a bool")
 
-# Keep each memmap open and use vectorized windows; this removes the old per-sample
-# Python slicing/astype loop, which was a significant input pipeline bottleneck.
-class TokenBatches:
-    def __init__(self):
-        self.maps = {}
-        for split, path in (("train", cfg.train_bin), ("val", cfg.val_bin)):
-            if not os.path.isfile(path):
-                raise FileNotFoundError(path)
-            data = np.memmap(path, dtype=dataset_dtype, mode="r")
-            if len(data) <= max_seq_len:
-                raise ValueError(f"{path} must contain more than max_seq_len tokens")
-            self.maps[split] = data
+    @property
+    def head_dim(self):
+        return self.hidden_size // self.num_attention_heads
 
-    def get(self, split):
-        data = self.maps[split]
-        starts = torch.randint(0, len(data) - max_seq_len, (batch_size,)).numpy()
-        offsets = np.arange(max_seq_len + 1, dtype=np.int64)
-        windows = np.asarray(data[starts[:, None] + offsets[None, :]], dtype=np.int64)
-        x = torch.from_numpy(windows[:, :-1].copy())
-        y = torch.from_numpy(windows[:, 1:].copy())
-        if device_type == "cuda":
-            x = x.pin_memory().to(device, non_blocking=True)
-            y = y.pin_memory().to(device, non_blocking=True)
-        else:
-            x, y = x.to(device), y.to(device)
-        return x, y
+    @property
+    def num_queries_per_kv(self):
+        return self.num_attention_heads // self.num_key_value_heads
 
 
-batches = TokenBatches()
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.eps).to(x.dtype) * self.weight
 
 
-def model_values():
-    return {name: getattr(cfg, name) for name in (
-        "vocab_size", "hidden_size", "num_hidden_layers", "intermediate_size",
-        "num_attention_heads", "num_key_value_heads", "attention_dropout",
-        "hidden_dropout", "rms_norm_eps", "rope_theta", "tie_word_embeddings",
-        "initializer_range") } | {"max_seq_len": max_seq_len}
+class RoPE(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int, theta: float):
+        super().__init__()
+        inv_freq = 1.0 / theta ** (
+            torch.arange(0, dim, 2, dtype=torch.float32) / dim
+        )
+        angles = torch.outer(
+            torch.arange(max_seq_len, dtype=torch.float32), inv_freq
+        )
+        self.register_buffer("cos", angles.cos(), persistent=False)
+        self.register_buffer("sin", angles.sin(), persistent=False)
+
+    def forward(self, x, position_offset=0):
+        seq_len = x.size(1)
+        end = position_offset + seq_len
+        if position_offset < 0 or end > self.cos.size(0):
+            raise ValueError(
+                f"position range [{position_offset}, {end}) exceeds RoPE limit "
+                f"{self.cos.size(0)}"
+            )
+        cos = self.cos[position_offset:end].to(device=x.device, dtype=x.dtype)
+        sin = self.sin[position_offset:end].to(device=x.device, dtype=x.dtype)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        even, odd = x[..., 0::2], x[..., 1::2]
+        return torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1).flatten(-2)
 
 
-def make_model(values=None):
-    args = model_values()
-    if values:
-        args.update(values)
-    return Model5555LM(Config(**args))
+class GQAAttention(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_queries_per_kv = config.num_queries_per_kv
+        self.head_dim = config.head_dim
+        self.hidden_size = config.hidden_size
+        self.attention_dropout = config.attention_dropout
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.rope = RoPE(config.head_dim, config.max_seq_len, config.rope_theta)
+
+    def repeat_kv(self, x):
+        if self.num_queries_per_kv == 1:
+            return x
+        b, t, kv_heads, d = x.shape
+        return x[:, :, :, None, :].expand(
+            b, t, kv_heads, self.num_queries_per_kv, d
+        ).reshape(b, t, self.num_attention_heads, d)
+
+    def forward(self, x, attention_mask=None):
+        b, t, _ = x.shape
+        q = self.q_proj(x).view(b, t, self.num_attention_heads, self.head_dim)
+        k = self.k_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
+        v = self.v_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
+        q, k = self.rope(q), self.rope(k)
+        q = q.transpose(1, 2)
+        k = self.repeat_kv(k).transpose(1, 2)
+        v = self.repeat_kv(v).transpose(1, 2)
+
+        attn_mask = None
+        is_causal = attention_mask is None
+        if attention_mask is not None:
+            if attention_mask.shape != (b, t):
+                raise ValueError(f"attention_mask must have shape {(b, t)}")
+            if attention_mask.device != x.device:
+                attention_mask = attention_mask.to(device=x.device)
+            if attention_mask.dtype == torch.bool:
+                valid = attention_mask
+            elif attention_mask.is_floating_point() or attention_mask.dtype in (
+                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
+            ):
+                valid = attention_mask != 0
+            else:
+                raise TypeError("attention_mask must be boolean or numeric")
+            causal = torch.ones((t, t), device=x.device, dtype=torch.bool).tril()
+            attn_mask = (
+                causal[None, None, :, :] & valid[:, None, None, :] & valid[:, None, :, None]
+            )
+            is_causal = False
+
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+        y = y.transpose(1, 2).contiguous().view(b, t, self.hidden_size)
+        return self.o_proj(y)
 
 
-def checkpoint_files():
-    pattern = os.path.join(cfg.out_dir, f"{model_name}_ckpt_*.pt")
-    files = []
-    for path in glob.glob(pattern):
-        match = re.search(r"_(\d+)\.pt$", path)
-        if match:
-            files.append((int(match.group(1)), path))
-    files.sort()
-    return files
+class SwiGLU(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-def latest_checkpoint():
-    files = checkpoint_files()
-    if files:
-        return files[-1][1]
-    legacy = os.path.join(cfg.out_dir, cfg.checkpoint_name)
-    return legacy if os.path.isfile(legacy) else None
+class Block(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.self_attn = GQAAttention(config)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.mlp = SwiGLU(config)
+        self.hidden_dropout = nn.Dropout(config.hidden_dropout)
+
+    def forward(self, x, attention_mask=None):
+        x = x + self.hidden_dropout(
+            self.self_attn(self.input_layernorm(x), attention_mask)
+        )
+        x = x + self.hidden_dropout(
+            self.mlp(self.post_attention_layernorm(x))
+        )
+        return x
 
 
-iter_num = 0
-best_val_loss = float("inf")
-checkpoint = None
-if cfg.init_from == "resume":
-    path = latest_checkpoint()
-    if path is None:
-        raise FileNotFoundError(f"No checkpoint found in {cfg.out_dir}")
-    if master_process:
-        print(f"resuming from {path}")
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    model = make_model(checkpoint.get("model_args"))
-    state = {key.removeprefix("_orig_mod."): value for key, value in checkpoint["model"].items()}
-    model.load_state_dict(state)
-    iter_num = int(checkpoint.get("iter_num", checkpoint.get("step", 0)))
-    best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
-else:
-    model = make_model()
+class Model5555LM(nn.Module):
+    """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``."""
 
-model.to(device)
-if master_process and cfg.print_model_info:
-    print(f"parameters={model.get_num_params():,}, fp16 size={model.get_model_size_mb():.8g} MB")
+    def __init__(self, config: Optional[Config] = None, **overrides):
+        super().__init__()
+        if config is None:
+            config = Config()
+        if not isinstance(config, Config):
+            raise TypeError("config must be an instance of Config")
+        if overrides:
+            values = asdict(config)
+            values.update(overrides)
+            config = Config(**values)
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_dropout = nn.Dropout(config.hidden_dropout)
+        self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
+        self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.apply(self._init_weights)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+        residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
+        for layer in self.layers:
+            nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
+            nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
 
-decay, no_decay = [], []
-for parameter in model.parameters():
-    if parameter.requires_grad:
-        (decay if parameter.ndim >= 2 else no_decay).append(parameter)
-fused = device_type == "cuda" and "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
-optimizer = torch.optim.AdamW(
-    [{"params": decay, "weight_decay": cfg.weight_decay}, {"params": no_decay, "weight_decay": 0.0}],
-    lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), fused=fused)
-if checkpoint is not None and "optimizer" in checkpoint:
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, std=self.config.initializer_range)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, std=self.config.initializer_range)
+        elif isinstance(module, RMSNorm):
+            nn.init.ones_(module.weight)
 
-if cfg.compile_model:
-    model = torch.compile(model)
-if ddp:
-    model = DDP(model, device_ids=[local_rank])
-raw_model = model.module if ddp else model
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
+        if not isinstance(input_ids, torch.Tensor):
+            raise TypeError("input_ids must be a torch.Tensor")
+        if input_ids.ndim != 2:
+            raise ValueError(f"input_ids must have shape [B, T], got {tuple(input_ids.shape)}")
+        if input_ids.dtype != torch.long:
+            raise TypeError(f"input_ids must be torch.long, got {input_ids.dtype}")
+        b, t = input_ids.shape
+        if b <= 0 or t <= 0:
+            raise ValueError("batch size and sequence length must be > 0")
+        if t > self.config.max_seq_len:
+            raise ValueError(f"sequence length {t} exceeds max_seq_len {self.config.max_seq_len}")
+        if attention_mask is not None:
+            if not isinstance(attention_mask, torch.Tensor):
+                raise TypeError("attention_mask must be a torch.Tensor")
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError("attention_mask must have the same shape as input_ids")
+            if attention_mask.device != input_ids.device:
+                raise ValueError("attention_mask and input_ids must be on the same device")
+            if attention_mask.dtype == torch.bool:
+                attention_mask = attention_mask.to(torch.bool)
+            elif attention_mask.is_floating_point() or attention_mask.dtype in (
+                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
+            ):
+                attention_mask = attention_mask != 0
+            else:
+                raise TypeError("attention_mask must be boolean or numeric")
+        if input_ids.min() < 0 or input_ids.max() >= self.config.vocab_size:
+            raise ValueError(f"input_ids contains a token outside [0, {self.config.vocab_size})")
+        x = self.embed_dropout(self.embed_tokens(input_ids))
+        hidden_states = [] if output_hidden_states else None
+        for layer in self.layers:
+            x = layer(x, attention_mask)
+            if output_hidden_states:
+                hidden_states.append(x)
+        logits = self.lm_head(self.final_layernorm(x))
+        if output_hidden_states:
+            return logits, hidden_states
+        return logits
 
+    def get_num_params(self):
+        return sum(p.numel() for p in self.parameters())
 
-def language_loss(logits, targets):
-    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+    def get_trainable_params(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+    def get_model_size_mb(self, dtype_bytes=2):
+        if not isinstance(dtype_bytes, Real) or not math.isfinite(dtype_bytes) or dtype_bytes <= 0:
+            raise ValueError("dtype_bytes must be finite and > 0")
+        return self.get_num_params() * dtype_bytes / 1024**2
 
-@torch.no_grad()
-def estimate_loss():
-    """Every rank evaluates, then all ranks receive the same global averages."""
-    model.eval()
-    totals = torch.zeros(2, device=device, dtype=torch.float64)
-    for index, split in enumerate(("train", "val")):
-        for _ in range(cfg.eval_iters):
-            x, y = batches.get(split)
-            with ctx:
-                value = language_loss(model(x), y)
-            totals[index] += value.detach().double()
-    if ddp:
-        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-    totals /= cfg.eval_iters * world_size
-    model.train()
-    return {"train": totals[0].item(), "val": totals[1].item()}
+    def get_model_size_gb(self, dtype_bytes=2):
+        return self.get_model_size_mb(dtype_bytes) / 1024
 
+    def get_flops_per_token(self, seq_len=None):
+        if seq_len is None:
+            seq_len = self.config.max_seq_len
+        if isinstance(seq_len, bool) or not isinstance(seq_len, int):
+            raise TypeError("seq_len must be an int")
+        if not 0 < seq_len <= self.config.max_seq_len:
+            raise ValueError("seq_len is outside the model context")
+        d, f = self.config.hidden_size, self.config.intermediate_size
+        h, kv, v, layers = self.config.num_attention_heads, self.config.num_key_value_heads, self.config.vocab_size, self.config.num_hidden_layers
+        head_dim = d // h
+        projection = 2 * (d*d + 2*d*kv*head_dim)
+        mlp = 6 * d * f
+        return layers * (projection + mlp + 4 * seq_len * d) + 2 * d * v
 
-def get_lr(step):
-    if not cfg.lr_decay:
-        return cfg.learning_rate
-    if step < cfg.warmup_iters:
-        return cfg.learning_rate * (step + 1) / (cfg.warmup_iters + 1)
-    if step >= cfg.lr_decay_iters:
-        return cfg.min_lr
-    ratio = (step - cfg.warmup_iters) / (cfg.lr_decay_iters - cfg.warmup_iters)
-    return cfg.min_lr + 0.5 * (1.0 + math.cos(math.pi * ratio)) * (cfg.learning_rate - cfg.min_lr)
+    def estimate_mfu(self, tokens_per_second, peak_flops):
+        for name, value in (("tokens_per_second", tokens_per_second), ("peak_flops", peak_flops)):
+            if not isinstance(value, Real) or not math.isfinite(value):
+                raise TypeError(f"{name} must be a finite number")
+        if tokens_per_second < 0:
+            raise ValueError("tokens_per_second must be >= 0")
+        if peak_flops <= 0:
+            raise ValueError("peak_flops must be > 0")
+        return tokens_per_second * self.get_flops_per_token() / peak_flops * 100.0
 
+    def get_config(self):
+        return asdict(self.config)
 
-# Optional tokenizer is used only for samples. The adapter supplies the interface
-# expected by Model5555LM.generate().
-tokenizer = None
-if os.path.isfile(cfg.tokenizer_path):
-    try:
-        from tokenizers import Tokenizer
-        backend_tokenizer = Tokenizer.from_file(cfg.tokenizer_path)
-        class TokenizerAdapter:
-            def encode(self, text):
-                return backend_tokenizer.encode(text).ids
-            def decode(self, ids):
-                return backend_tokenizer.decode(ids, skip_special_tokens=True)
-        tokenizer = TokenizerAdapter()
-    except (ImportError, Exception) as exc:
-        if master_process:
-            print(f"warning: tokenizer unavailable ({exc})")
+    @torch.no_grad()
+    def generate(self, text, tokenizer, max_new_tokens=100, temperature=1.0,
+                 top_k=None, top_p=None, eos_token_id=None, do_sample=True):
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
+            raise TypeError("max_new_tokens must be an int")
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be >= 0")
+        if not isinstance(do_sample, bool):
+            raise TypeError("do_sample must be a bool")
+        if not isinstance(temperature, Real) or not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be finite and > 0")
+        if top_k is not None and (isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0):
+            raise ValueError("top_k must be a positive integer")
+        if top_p is not None and (not isinstance(top_p, Real) or not math.isfinite(top_p) or not 0 < top_p <= 1):
+            raise ValueError("top_p must be finite and in (0, 1]")
+        if eos_token_id is not None:
+            if isinstance(eos_token_id, bool) or not isinstance(eos_token_id, int):
+                raise TypeError("eos_token_id must be an int")
+            if not 0 <= eos_token_id < self.config.vocab_size:
+                raise ValueError("eos_token_id is outside vocabulary")
 
+        encoded = tokenizer.encode(text)
+        ids = encoded.to(dtype=torch.long) if isinstance(encoded, torch.Tensor) else torch.tensor(encoded, dtype=torch.long)
+        if ids.ndim == 1:
+            ids = ids.unsqueeze(0)
+        if ids.ndim != 2 or ids.size(0) != 1:
+            raise ValueError("tokenizer.encode must return one sequence")
+        if ids.size(1) == 0:
+            raise ValueError("prompt must contain at least one token")
+        if ids.min() < 0 or ids.max() >= self.config.vocab_size:
+            raise ValueError("tokenizer produced a token outside the model vocabulary")
 
-def sample_text():
-    if tokenizer is None or not master_process:
-        return
-    was_training = raw_model.training
-    raw_model.eval()
-    print("samples:")
-    for number in range(cfg.sample_count):
-        source, _ = batches.get("val")
-        prompt_ids = source[0, :min(cfg.sample_prompt_tokens, max_seq_len)].cpu().tolist()
-        prompt = tokenizer.decode(prompt_ids)
+        output_ids = ids.to(device=self.embed_tokens.weight.device, dtype=torch.long)
+        was_training = self.training
+        self.eval()
         try:
-            output = raw_model.generate(prompt, tokenizer, max_new_tokens=cfg.sample_new_tokens,
-                                        temperature=cfg.sample_temperature, top_k=cfg.sample_top_k,
-                                        top_p=cfg.sample_top_p, eos_token_id=cfg.eos_token_id)
-            print(f"  [{number + 1}] {output}")
-        except Exception as exc:
-            print(f"  [{number + 1}] generation failed: {exc}")
-    raw_model.train(was_training)
-
-
-def save_checkpoint(step, val_loss):
-    if not master_process or not cfg.save_checkpoint:
-        return
-    payload = {"model": raw_model.state_dict(), "optimizer": optimizer.state_dict(),
-               "model_args": raw_model.get_config(), "iter_num": step,
-               "best_val_loss": val_loss, "config": cfg.as_dict(),
-               "rng_state": torch.get_rng_state()}
-    path = os.path.join(cfg.out_dir, f"{model_name}_ckpt_{step}.pt")
-    temporary = path + f".tmp.{os.getpid()}"
-    torch.save(payload, temporary)
-    os.replace(temporary, path)
-    # A stable pointer makes external resume tooling simple while numbered files
-    # remain available for rollback.
-    latest = os.path.join(cfg.out_dir, f"{model_name}_latest.pt")
-    latest_tmp = latest + f".tmp.{os.getpid()}"
-    torch.save(payload, latest_tmp)
-    os.replace(latest_tmp, latest)
-    print(f"saved checkpoint: {path}")
-
-
-X, Y = batches.get("train")
-last_time = time.perf_counter()
-local_step = 0
-running_mfu = None
-while iter_num < cfg.max_iters:
-    lr = get_lr(iter_num)
-    for group in optimizer.param_groups:
-        group["lr"] = lr
-
-    if iter_num % cfg.eval_interval == 0:
-        # This collective must be called by every rank. Only rank zero prints/saves.
-        losses = estimate_loss()
-        if master_process:
-            print(f"step={iter_num:06d} train_loss={losses['train']:.16g} "
-                  f"val_loss={losses['val']:.16g} lr={lr:.16g}")
-            sample_text()
-            improved = losses["val"] < best_val_loss
-            if improved:
-                best_val_loss = losses["val"]
-            if iter_num > 0 and (improved or cfg.always_save_checkpoint):
-                save_checkpoint(iter_num, best_val_loss)
-        if ddp:
-            dist.barrier()
-    if iter_num == 0 and cfg.eval_only:
-        break
-
-    step_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    for micro_step in range(local_grad_accum):
-        if ddp:
-            model.require_backward_grad_sync = micro_step == local_grad_accum - 1
-        with ctx:
-            logits = model(X)
-            micro_loss = language_loss(logits, Y)
-            loss = micro_loss / local_grad_accum
-        step_loss_sum += micro_loss.detach().double()
-        X, Y = batches.get("train")
-        scaler.scale(loss).backward()
-    if cfg.grad_clip:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-    scaler.step(optimizer)
-    scaler.update()
-    optimizer.zero_grad(set_to_none=True)
-
-    if ddp:
-        dist.all_reduce(step_loss_sum, op=dist.ReduceOp.SUM)
-    average_step_loss = (step_loss_sum / (local_grad_accum * world_size)).item()
-    now = time.perf_counter()
-    elapsed = now - last_time
-    last_time = now
-    if iter_num % cfg.log_interval == 0 and master_process:
-        tokens_per_second = tokens_per_step / max(elapsed, 1e-9)
-        flops_per_token = raw_model.get_flops_per_token(max_seq_len)
-        flops_per_second = tokens_per_second * flops_per_token
-        mfu = None
-        if cfg.peak_flops:
-            mfu = raw_model.estimate_mfu(tokens_per_second, cfg.peak_flops)
-            running_mfu = mfu if running_mfu is None else 0.9 * running_mfu + 0.1 * mfu
-        mfu_text = "n/a" if running_mfu is None else f"{running_mfu:.8g}%"
-        print(f"iter={iter_num:06d} loss={average_step_loss:.16g} "
-              f"time={elapsed:.8g}s tokens/s={tokens_per_second:.8g} "
-              f"FLOP/token={flops_per_token:.8g} FLOP/s={flops_per_second:.8g} MFU={mfu_text}")
-    iter_num += 1
-    local_step += 1
-
-# max_iters is an exclusive update count: max_iters=1000 performs steps 0..999.
-if master_process and cfg.save_checkpoint and iter_num > 0:
-    save_checkpoint(iter_num, best_val_loss)
-if ddp:
-    dist.destroy_process_group()
+            for _ in range(max_new_tokens):
+                context = output_ids[:, -self.config.max_seq_len:]
+                logits = self(context)[:, -1, :]
+                if not do_sample:
+                    next_token = logits.argmax(dim=-1, keepdim=True)
+                else:
+                    logits = logits / temperature
+                    if top_k is not None:
+                        k = min(top_k, logits.size(-1))
+                        threshold = torch.topk(logits, k, dim=-1).values[:, [-1]]
+                        logits = logits.masked_fill(logits < threshold, float("-inf"))
+                    if top_p is not None and top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                        cumulative = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+                        remove = cumulative > top_p
+                        remove[..., 1:] = remove[..., :-1].clone()
+                        remove[..., 0] = False
+                        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+                        logits = torch.full_like(logits, float("-inf"))
+                        logits.scatter_(-1, sorted_indices, sorted_logits)
+                    if not torch.isfinite(logits).any(dim=-1).all():
+                        raise RuntimeError("model produced no finite logits for sampling")
+                    next_token = torch.multinomial(F.softmax(logits, dim=-1), 1)
+                output_ids = torch.cat((output_ids, next_token), dim=1)
+                if eos_token_id is not None and bool((next_token == eos_token_id).all()):
+                    break
+        finally:
+            self.train(was_training)
+        return tokenizer.decode(output_ids[0].tolist())
