@@ -182,40 +182,26 @@ class GQAAttention(nn.Module):
 
 
 import torch
-import torch.nn as nn
-
 class SwiGLU(nn.Module):
-    """
-    EXPERIMENTAL: This class is named SwiGLU to maintain compatibility 
-    with your existing architecture, but it ACTUALLY implements PowGLU 
-    (PowerLU Gated Linear Unit) for testing numerical stability.
-    
-    Optimized mathematically to prevent hidden float32 upcasting and OOM.
-    """
-    def __init__(self, config):
+    def __init__(self, config: Config):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        
-        # PowLU Hyperparameters (alpha is fixed to 1.5 via x * sqrt(x) substitution)
-        self.beta = 0.1
+        # Structural Breakthrough: Combines gate and up projections into 1 massive matrix
+        self.gate_up_proj = nn.Linear(
+            config.hidden_size, 2 * config.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
 
     def forward(self, x):
-        # 1. Project to gating and upstream channels
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
+        # 1. Compute both projections simultaneously in a single parallel operation
+        combined_proj = self.gate_up_proj(x)
         
-        # 2. Compute PowLU activation on the gating branch
-        pos = torch.clamp(gate, min=0.0)
-        neg = torch.clamp(gate, max=0.0)
+        # 2. Slice the resulting matrix in half along the last dimension
+        gate, up = torch.chunk(combined_proj, chunks=2, dim=-1)
         
-        # Optimized x^1.5 substitution: pos * torch.sqrt(pos) 
-        # This keeps activations lightweight and memory friendly
-        powlu_gate = (pos * torch.sqrt(pos)) + (self.beta * neg)
-        
-        # 3. GLU Element-wise multiplication and down projection
-        return self.down_proj(powlu_gate * up)
+        # 3. Apply the activation function and drop down back to hidden size
+        return self.down_proj(F.silu(gate) * up)
 
 
 class Block(nn.Module):
