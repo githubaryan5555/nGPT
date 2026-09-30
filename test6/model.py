@@ -181,27 +181,19 @@ class GQAAttention(nn.Module):
 
 
 
-import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        # Structural Breakthrough: Combines gate and up projections into 1 massive matrix
-        self.gate_up_proj = nn.Linear(
-            config.hidden_size, 2 * config.intermediate_size, bias=False
-        )
-        self.down_proj = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=False
-        )
+        # Single up-projection to match traditional MLP behavior
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        # 1. Compute both projections simultaneously in a single parallel operation
-        combined_proj = self.gate_up_proj(x)
-        
-        # 2. Slice the resulting matrix in half along the last dimension
-        gate, up = torch.chunk(combined_proj, chunks=2, dim=-1)
-        
-        # 3. Apply the activation function and drop down back to hidden size
-        return self.down_proj(F.silu(gate) * up)
+        # 1 Linear up-projection -> GELU activation -> 1 Linear down-projection
+        return self.down_proj(F.gelu(self.up_proj(x)))
 
 
 class Block(nn.Module):
