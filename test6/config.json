@@ -35,7 +35,7 @@
   "warmup_iters": 100,
   "lr_decay_iters": 1000,
   "device": "cuda",
-  "dtype": "bfloat16",
+  "dtype": "float16",
   "compile_model": true,
   "backend": "nccl",
   "out_dir": "out_model5555",
