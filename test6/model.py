@@ -115,6 +115,20 @@ class RoPE(nn.Module):
         return torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1).flatten(-2)
 
 
+class MLPBlock(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.mlp = SwiGLU(config)
+        self.hidden_dropout = nn.Dropout(config.hidden_dropout)
+
+    def forward(self, x):
+        return x + self.hidden_dropout(
+            self.mlp(self.layernorm(x))
+        )
+
+
+
 class GQAAttention(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -225,7 +239,16 @@ class Model5555LM(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
-        self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
+
+
+        self.layers = nn.ModuleList(
+            Block(config) for _ in range(config.num_hidden_layers - 4)
+        )
+
+         self.final_mlp_layers = nn.ModuleList(
+            MLPBlock(config) for _ in range(4)
+        )
+        
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._init_weights)
@@ -236,6 +259,16 @@ class Model5555LM(nn.Module):
             nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
             nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
 
+        for layer in self.final_mlp_layers:
+            nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
+
+
+
+
+
+
+
+    
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, std=self.config.initializer_range)
