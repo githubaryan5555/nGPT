@@ -244,8 +244,8 @@ class Model5555LM(nn.Module):
         self.layers = nn.ModuleList(
             Block(config) for _ in range(config.num_hidden_layers - 4)
         )
-
-         self.final_mlp_layers = nn.ModuleList(
+        
+        self.final_mlp_layers = nn.ModuleList(
             MLPBlock(config) for _ in range(4)
         )
         
