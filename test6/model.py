@@ -179,15 +179,37 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
+
+
 class SwiGLU(nn.Module):
-    def __init__(self, config: Config):
+    """
+    EXPERIMENTAL: This class is named SwiGLU to maintain compatibility 
+    with your existing architecture, but it ACTUALLY implements PowGLU 
+    (PowerLU Gated Linear Unit) for testing numerical stability.
+    """
+    def __init__(self, config):
         super().__init__()
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        
+        # PowLU Hyperparameters (alpha: exponent power, beta: negative slope floor)
+        self.alpha = 1.5 
+        self.beta = 0.1
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        # 1. Project to gating and upstream channels
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        
+        # 2. Compute PowLU activation on the gating branch
+        pos = torch.clamp(gate, min=0.0)
+        neg = torch.clamp(gate, max=0.0)
+        powlu_gate = (pos ** self.alpha) + (self.beta * neg)
+        
+        # 3. GLU Element-wise multiplication and down projection
+        # This whole block safely fuses when passed through torch.compile()
+        return self.down_proj(powlu_gate * up)
 
 
 class Block(nn.Module):
