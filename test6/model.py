@@ -182,9 +182,10 @@ class GQAAttention(nn.Module):
 
                       
         
-    
-    
- class SwiGLU(nn.Module):
+
+
+
+class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
 
@@ -198,14 +199,12 @@ class GQAAttention(nn.Module):
             config.intermediate_size // self.num_experts
         )
 
-        # Tiny sequence-level router.
         self.router = nn.Linear(
             config.hidden_size,
             self.num_experts,
             bias=False,
         )
 
-        # 8 small SwiGLU experts.
         self.gate_proj = nn.ModuleList([
             nn.Linear(
                 config.hidden_size,
@@ -234,32 +233,24 @@ class GQAAttention(nn.Module):
         ])
 
     def forward(self, x):
-        # x: [B, T, H]
-
         B, T, H = x.shape
 
-        # ---------------------------------------------------------
-        # Sequence-level routing
-        # ---------------------------------------------------------
+        # Sequence-level router
+        sequence_repr = x.mean(dim=1)
 
-        # One representation for the entire sequence.
-        sequence_repr = x.mean(dim=1)              # [B, H]
-
-        router_logits = self.router(sequence_repr) # [B, 8]
+        router_logits = self.router(sequence_repr)
 
         router_probs = F.softmax(
             router_logits,
             dim=-1,
         )
 
-        # Select 4 experts for each sequence.
         top_values, top_indices = torch.topk(
             router_probs,
             self.top_k,
             dim=-1,
         )
 
-        # Renormalize selected experts.
         top_values = top_values / (
             top_values.sum(
                 dim=-1,
@@ -267,26 +258,17 @@ class GQAAttention(nn.Module):
             ) + 1e-8
         )
 
-        # ---------------------------------------------------------
-        # Expert execution
-        # ---------------------------------------------------------
-
         output = torch.zeros_like(x)
 
-        # Each selected expert is executed only for the
-        # batch elements that selected it.
         for expert_id in range(self.num_experts):
 
-            # Which sequences selected this expert?
             mask = (top_indices == expert_id).any(dim=-1)
 
             if not mask.any():
                 continue
 
-            # Batch elements belonging to this expert.
             x_expert = x[mask]
 
-            # SwiGLU.
             gate = self.gate_proj[expert_id](x_expert)
             up = self.up_proj[expert_id](x_expert)
 
@@ -294,8 +276,6 @@ class GQAAttention(nn.Module):
 
             expert_output = self.down_proj[expert_id](hidden)
 
-            # Find this expert's routing weight for each
-            # selected sequence.
             expert_positions = (
                 top_indices[mask] == expert_id
             )
@@ -305,18 +285,11 @@ class GQAAttention(nn.Module):
                 * expert_positions.to(top_values.dtype)
             ).sum(dim=-1)
 
-            weights = weights.view(
-                -1,
-                1,
-                1,
-            )
+            weights = weights.view(-1, 1, 1)
 
             output[mask] += expert_output * weights
 
         return output
-
-
-
 
 
 class Block(nn.Module):
