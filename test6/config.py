@@ -3,10 +3,18 @@
 import json
 import os
 
+_DEFAULTS = {
+    "use_multi_token_pred": False,
+    "num_pred_tokens": 4,
+}
+
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
 with open(_CONFIG_PATH, "r", encoding="utf-8") as file:
     _values = json.load(file)
+
+for key, value in _DEFAULTS.items():
+    _values.setdefault(key, value)
 
 globals().update(_values)
 
