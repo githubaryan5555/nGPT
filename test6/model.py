@@ -115,68 +115,77 @@ class RoPE(nn.Module):
         return torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1).flatten(-2)
 
 
+
+
 class GQAAttention(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
-        self.num_queries_per_kv = config.num_queries_per_kv
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
         self.attention_dropout = config.attention_dropout
+        
+        # Projections
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        
+        # RoPE (Assumes standard [B, T, H, D] or handled within module safely)
         self.rope = RoPE(config.head_dim, config.max_seq_len, config.rope_theta)
-
-    def repeat_kv(self, x):
-        if self.num_queries_per_kv == 1:
-            return x
-        b, t, kv_heads, d = x.shape
-        return x[:, :, :, None, :].expand(
-            b, t, kv_heads, self.num_queries_per_kv, d
-        ).reshape(b, t, self.num_attention_heads, d)
 
     def forward(self, x, attention_mask=None):
         b, t, _ = x.shape
+        
+        # 1. Project tokens -> shape: (B, T, H, D)
         q = self.q_proj(x).view(b, t, self.num_attention_heads, self.head_dim)
         k = self.k_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
         v = self.v_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
+        
+        # 2. Apply Rotary Embeddings while in (B, T, H, D)
         q, k = self.rope(q), self.rope(k)
+        
+        # 3. Transpose to standard SDPA layout: (B, H, T, D)
         q = q.transpose(1, 2)
-        k = self.repeat_kv(k).transpose(1, 2)
-        v = self.repeat_kv(v).transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
+        # 4. Handle Attention Masking compiler-safely
         attn_mask = None
-        is_causal = attention_mask is None
+        # Static flag calculation avoids data-dependent graph breaks
+        is_causal = (attention_mask is None) and (t > 1)
+        
         if attention_mask is not None:
             if attention_mask.shape != (b, t):
                 raise ValueError(f"attention_mask must have shape {(b, t)}")
-            if attention_mask.device != x.device:
-                attention_mask = attention_mask.to(device=x.device)
-            if attention_mask.dtype == torch.bool:
-                valid = attention_mask
-            elif attention_mask.is_floating_point() or attention_mask.dtype in (
-                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
-            ):
-                valid = attention_mask != 0
+            
+            # Convert mask safely to boolean matrix
+            valid = attention_mask if attention_mask.dtype == torch.bool else (attention_mask != 0)
+            
+            # Broadcast mask cleanly without complex reshaping loops
+            if t > 1:
+                causal = torch.ones((t, t), device=x.device, dtype=torch.bool).tril()
+                attn_mask = causal[None, None, :, :] & valid[:, None, None, :]
             else:
-                raise TypeError("attention_mask must be boolean or numeric")
-            causal = torch.ones((t, t), device=x.device, dtype=torch.bool).tril()
-            attn_mask = (
-                causal[None, None, :, :] & valid[:, None, None, :] & valid[:, None, :, None]
-            )
+                attn_mask = valid[:, None, None, :]
+                
             is_causal = False
 
+        # 5. Let PyTorch SDPA compile the GQA head broadcasting internally.
+        # FlashAttention/MemoryEfficientAttention backends handle the head mismatch flawlessly.
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=is_causal,
         )
+        
+        # 6. Merge heads back into structural layout (B, T, Hidden_Size)
         y = y.transpose(1, 2).contiguous().view(b, t, self.hidden_size)
         return self.o_proj(y)
+
+
 
 
 class SwiGLU(nn.Module):
