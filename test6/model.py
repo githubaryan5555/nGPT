@@ -180,14 +180,124 @@ class GQAAttention(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+
+        self.num_experts = 8
+        self.top_k = 4
+
+        # Each expert is 1/8 the size of the original SwiGLU.
+        expert_intermediate = max(
+            1,
+            self.intermediate_size // self.num_experts
+        )
+        self.expert_intermediate = expert_intermediate
+
+        # Tiny sequence-level router.
+        #
+        # [B, T, H]
+        #     ↓ mean over sequence
+        # [B, H]
+        #     ↓
+        # [B, 8]
+        self.router = nn.Linear(
+            self.hidden_size,
+            self.num_experts,
+            bias=False,
+        )
+
+        # 8 small SwiGLU experts.
+        self.gate_proj = nn.ModuleList([
+            nn.Linear(
+                self.hidden_size,
+                expert_intermediate,
+                bias=True,
+            )
+            for _ in range(self.num_experts)
+        ])
+
+        self.up_proj = nn.ModuleList([
+            nn.Linear(
+                self.hidden_size,
+                expert_intermediate,
+                bias=True,
+            )
+            for _ in range(self.num_experts)
+        ])
+
+        self.down_proj = nn.ModuleList([
+            nn.Linear(
+                expert_intermediate,
+                self.hidden_size,
+                bias=True,
+            )
+            for _ in range(self.num_experts)
+        ])
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        # x: [B, T, H]
+
+        # ---------------------------------------------------------
+        # Sequence-level routing
+        # ---------------------------------------------------------
+        #
+        # One router decision for the entire sequence.
+        sequence_repr = x.mean(dim=1)          # [B, H]
+
+        router_logits = self.router(sequence_repr)  # [B, 8]
+
+        router_probs = F.softmax(router_logits, dim=-1)
+
+        # Select 4 of the 8 experts for each sequence.
+        top_values, top_indices = torch.topk(
+            router_probs,
+            self.top_k,
+            dim=-1,
+        )
+
+        # Renormalize selected experts so their weights sum to 1.
+        top_values = top_values / (
+            top_values.sum(dim=-1, keepdim=True) + 1e-8
+        )
+
+        # ---------------------------------------------------------
+        # Run selected experts
+        # ---------------------------------------------------------
+        #
+        # We process each expert only for the batch elements
+        # that selected it.
+        output = torch.zeros_like(x)
+
+        for k in range(self.top_k):
+            expert_indices = top_indices[:, k]   # [B]
+            expert_weights = top_values[:, k]     # [B]
+
+            for expert_id in range(self.num_experts):
+                mask = expert_indices == expert_id
+
+                if not mask.any():
+                    continue
+
+                x_selected = x[mask]
+
+                gate = self.gate_proj[expert_id](x_selected)
+                up = self.up_proj[expert_id](x_selected)
+
+                hidden = F.silu(gate) * up
+
+                expert_output = self.down_proj[expert_id](hidden)
+
+                weight = expert_weights[mask].view(
+                    -1, 1, 1
+                )
+
+                output[mask] += expert_output * weight
+
+        return output
+
 
 
 class Block(nn.Module):
