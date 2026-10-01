@@ -179,117 +179,15 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
-
-                      
-        
-
-
-
 class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-
-        self.num_experts = 8
-        self.top_k = 4
-
-        self.expert_intermediate = (
-            config.intermediate_size // self.num_experts
-        )
-
-        self.router = nn.Linear(
-            config.hidden_size,
-            self.num_experts,
-            bias=False,
-        )
-
-        self.gate_proj = nn.ModuleList([
-            nn.Linear(
-                config.hidden_size,
-                self.expert_intermediate,
-                bias=False,
-            )
-            for _ in range(self.num_experts)
-        ])
-
-        self.up_proj = nn.ModuleList([
-            nn.Linear(
-                config.hidden_size,
-                self.expert_intermediate,
-                bias=False,
-            )
-            for _ in range(self.num_experts)
-        ])
-
-        self.down_proj = nn.ModuleList([
-            nn.Linear(
-                self.expert_intermediate,
-                config.hidden_size,
-                bias=False,
-            )
-            for _ in range(self.num_experts)
-        ])
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        B, T, H = x.shape
-
-        # Sequence-level router
-        sequence_repr = x.mean(dim=1)
-
-        router_logits = self.router(sequence_repr)
-
-        router_probs = F.softmax(
-            router_logits,
-            dim=-1,
-        )
-
-        top_values, top_indices = torch.topk(
-            router_probs,
-            self.top_k,
-            dim=-1,
-        )
-
-        top_values = top_values / (
-            top_values.sum(
-                dim=-1,
-                keepdim=True,
-            ) + 1e-8
-        )
-
-        output = torch.zeros_like(x)
-
-        for expert_id in range(self.num_experts):
-
-            mask = (top_indices == expert_id).any(dim=-1)
-
-            if not mask.any():
-                continue
-
-            x_expert = x[mask]
-
-            gate = self.gate_proj[expert_id](x_expert)
-            up = self.up_proj[expert_id](x_expert)
-
-            hidden = F.silu(gate) * up
-
-            expert_output = self.down_proj[expert_id](hidden)
-
-            expert_positions = (
-                top_indices[mask] == expert_id
-            )
-
-            weights = (
-                top_values[mask]
-                * expert_positions.to(top_values.dtype)
-            ).sum(dim=-1)
-
-            weights = weights.view(-1, 1, 1)
-
-            output[mask] += expert_output * weights
-
-        return output
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Block(nn.Module):
@@ -336,8 +234,7 @@ class Model5555LM(nn.Module):
         residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
         for layer in self.layers:
             nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
-            for proj in layer.mlp.down_proj:
-                nn.init.normal_(proj.weight, std=residual_std)
+            nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
