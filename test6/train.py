@@ -58,7 +58,6 @@ dataset_dtype = np.dtype(cfg.dataset_dtype)
 if dataset_dtype.kind not in "iu":
     raise ValueError("dataset_dtype must be an integer NumPy dtype")
 
-# DDP is initialized before any device-dependent work.
 ddp = int(os.environ.get("RANK", -1)) >= 0
 if ddp:
     dist.init_process_group(backend=cfg.backend)
@@ -98,8 +97,7 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-# Keep each memmap open and use vectorized windows; this removes the old per-sample
-# Python slicing/astype loop, which was a significant input pipeline bottleneck.
+
 class TokenBatches:
     def __init__(self):
         self.maps = {}
@@ -130,11 +128,24 @@ batches = TokenBatches()
 
 
 def model_values():
-    return {name: getattr(cfg, name) for name in (
-        "vocab_size", "hidden_size", "num_hidden_layers", "intermediate_size",
-        "num_attention_heads", "num_key_value_heads", "attention_dropout",
-        "hidden_dropout", "rms_norm_eps", "rope_theta", "tie_word_embeddings",
-        "initializer_range") } | {"max_seq_len": max_seq_len}
+    values = {
+        "vocab_size": cfg.vocab_size,
+        "hidden_size": cfg.hidden_size,
+        "num_hidden_layers": cfg.num_hidden_layers,
+        "intermediate_size": cfg.intermediate_size,
+        "num_attention_heads": cfg.num_attention_heads,
+        "num_key_value_heads": cfg.num_key_value_heads,
+        "attention_dropout": cfg.attention_dropout,
+        "hidden_dropout": cfg.hidden_dropout,
+        "rms_norm_eps": cfg.rms_norm_eps,
+        "rope_theta": cfg.rope_theta,
+        "tie_word_embeddings": cfg.tie_word_embeddings,
+        "initializer_range": cfg.initializer_range,
+        "use_multi_token_pred": getattr(cfg, "use_multi_token_pred", False),
+        "num_pred_tokens": getattr(cfg, "num_pred_tokens", 4),
+        "max_seq_len": max_seq_len,
+    }
+    return values
 
 
 def make_model(values=None):
@@ -204,12 +215,35 @@ raw_model = model.module if ddp else model
 
 
 def language_loss(logits, targets):
-    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+    if logits.dim() == 3:
+        return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+    if logits.dim() != 4:
+        raise ValueError(f"expected logits shape [B, T, V] or [B, N, T, V], got {tuple(logits.shape)}")
+
+    weights = torch.tensor([1.0, 0.8, 0.6, 0.4], device=logits.device, dtype=logits.dtype)
+    branch_count = min(logits.size(1), weights.numel())
+    losses = []
+    for branch_idx in range(branch_count):
+        offset = branch_idx + 1
+        if targets.size(1) <= offset:
+            continue
+        branch_logits = logits[:, branch_idx, :-offset, :]
+        branch_targets = targets[:, offset:]
+        if branch_logits.shape[:2] != branch_targets.shape[:2]:
+            raise ValueError(f"target alignment mismatch for branch {branch_idx}: logits={tuple(branch_logits.shape)}, targets={tuple(branch_targets.shape)}")
+        loss = F.cross_entropy(
+            branch_logits.reshape(-1, branch_logits.size(-1)),
+            branch_targets.reshape(-1),
+            reduction="none",
+        ).reshape(branch_targets.shape)
+        losses.append(loss.mean() * weights[branch_idx])
+    if not losses:
+        return logits.new_zeros(())
+    return sum(losses) / sum(weights[: len(losses)])
 
 
 @torch.no_grad()
 def estimate_loss():
-    """Every rank evaluates, then all ranks receive the same global averages."""
     model.eval()
     totals = torch.zeros(2, device=device, dtype=torch.float64)
     for index, split in enumerate(("train", "val")):
@@ -236,8 +270,6 @@ def get_lr(step):
     return cfg.min_lr + 0.5 * (1.0 + math.cos(math.pi * ratio)) * (cfg.learning_rate - cfg.min_lr)
 
 
-# Optional tokenizer is used only for samples. The adapter supplies the interface
-# expected by Model5555LM.generate().
 tokenizer = None
 if os.path.isfile(cfg.tokenizer_path):
     try:
@@ -285,8 +317,6 @@ def save_checkpoint(step, val_loss):
     temporary = path + f".tmp.{os.getpid()}"
     torch.save(payload, temporary)
     os.replace(temporary, path)
-    # A stable pointer makes external resume tooling simple while numbered files
-    # remain available for rollback.
     latest = os.path.join(cfg.out_dir, f"{model_name}_latest.pt")
     latest_tmp = latest + f".tmp.{os.getpid()}"
     torch.save(payload, latest_tmp)
@@ -304,7 +334,6 @@ while iter_num < cfg.max_iters:
         group["lr"] = lr
 
     if iter_num % cfg.eval_interval == 0:
-        # This collective must be called by every rank. Only rank zero prints/saves.
         losses = estimate_loss()
         if master_process:
             print(f"step={iter_num:06d} train_loss={losses['train']:.16g} "
@@ -359,7 +388,6 @@ while iter_num < cfg.max_iters:
     iter_num += 1
     local_step += 1
 
-# max_iters is an exclusive update count: max_iters=1000 performs steps 0..999.
 if master_process and cfg.save_checkpoint and iter_num > 0:
     save_checkpoint(iter_num, best_val_loss)
 if ddp:
