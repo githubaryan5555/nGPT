@@ -336,7 +336,8 @@ class Model5555LM(nn.Module):
         residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
         for layer in self.layers:
             nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
-            nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
+            for proj in layer.mlp.down_proj:
+                nn.init.normal_(proj.weight, std=residual_std)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
