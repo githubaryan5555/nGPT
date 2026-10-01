@@ -115,281 +115,68 @@ class RoPE(nn.Module):
         return torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1).flatten(-2)
 
 
-
-
 class GQAAttention(nn.Module):
-    """
-    GQA + shared query heads.
-
-    Example:
-        num_attention_heads = 16
-        num_key_value_heads = 4
-
-    Instead of 16 independent Q projections, this creates
-    4 Q projections and shares each Q across 4 query heads.
-
-    No Config changes required.
-    """
-
     def __init__(self, config: Config):
         super().__init__()
-
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_queries_per_kv = config.num_queries_per_kv
         self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
         self.attention_dropout = config.attention_dropout
-
-        # Number of unique query projections.
-        #
-        # Example:
-        #   16 Q heads / 4 KV heads = 4 unique Q heads
-        #
-        self.num_query_groups = config.num_key_value_heads
-
-        # ---------------------------------------------------------
-        # Shared Q projection
-        #
-        # Normal GQA:
-        #   hidden -> 16 * head_dim
-        #
-        # Here:
-        #   hidden -> 4 * head_dim
-        #
-        # Each Q head is then repeated inside its group.
-        # ---------------------------------------------------------
-        self.q_proj = nn.Linear(
-            config.hidden_size,
-            self.num_query_groups * config.head_dim,
-            bias=False,
-        )
-
-        self.k_proj = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * config.head_dim,
-            bias=False,
-        )
-
-        self.v_proj = nn.Linear(
-            config.hidden_size,
-            config.num_key_value_heads * config.head_dim,
-            bias=False,
-        )
-
-        self.o_proj = nn.Linear(
-            config.hidden_size,
-            config.hidden_size,
-            bias=False,
-        )
-
-        self.rope = RoPE(
-            config.head_dim,
-            config.max_seq_len,
-            config.rope_theta,
-        )
-
-    def repeat_q(self, x):
-        """
-        x:
-            [B, T, query_groups, D]
-
-        returns:
-            [B, T, num_attention_heads, D]
-        """
-
-        if self.num_queries_per_kv == 1:
-            return x
-
-        b, t, groups, d = x.shape
-
-        return (
-            x[:, :, :, None, :]
-            .expand(
-                b,
-                t,
-                groups,
-                self.num_queries_per_kv,
-                d,
-            )
-            .reshape(
-                b,
-                t,
-                self.num_attention_heads,
-                d,
-            )
-        )
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.rope = RoPE(config.head_dim, config.max_seq_len, config.rope_theta)
 
     def repeat_kv(self, x):
-        """
-        x:
-            [B, T, KV_heads, D]
-
-        returns:
-            [B, T, attention_heads, D]
-        """
-
         if self.num_queries_per_kv == 1:
             return x
-
         b, t, kv_heads, d = x.shape
-
-        return (
-            x[:, :, :, None, :]
-            .expand(
-                b,
-                t,
-                kv_heads,
-                self.num_queries_per_kv,
-                d,
-            )
-            .reshape(
-                b,
-                t,
-                self.num_attention_heads,
-                d,
-            )
-        )
+        return x[:, :, :, None, :].expand(
+            b, t, kv_heads, self.num_queries_per_kv, d
+        ).reshape(b, t, self.num_attention_heads, d)
 
     def forward(self, x, attention_mask=None):
         b, t, _ = x.shape
-
-        # ---------------------------------------------------------
-        # Q
-        #
-        # Only generate one Q per KV group.
-        # ---------------------------------------------------------
-
-        q = self.q_proj(x).view(
-            b,
-            t,
-            self.num_query_groups,
-            self.head_dim,
-        )
-
-        # Share each Q across its group.
-        q = self.repeat_q(q)
-
-        # ---------------------------------------------------------
-        # K / V
-        # ---------------------------------------------------------
-
-        k = self.k_proj(x).view(
-            b,
-            t,
-            self.num_key_value_heads,
-            self.head_dim,
-        )
-
-        v = self.v_proj(x).view(
-            b,
-            t,
-            self.num_key_value_heads,
-            self.head_dim,
-        )
-
-        # ---------------------------------------------------------
-        # RoPE
-        # ---------------------------------------------------------
-
-        q = self.rope(q)
-        k = self.rope(k)
-
-        # ---------------------------------------------------------
-        # [B,T,H,D] -> [B,H,T,D]
-        # ---------------------------------------------------------
-
+        q = self.q_proj(x).view(b, t, self.num_attention_heads, self.head_dim)
+        k = self.k_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
+        v = self.v_proj(x).view(b, t, self.num_key_value_heads, self.head_dim)
+        q, k = self.rope(q), self.rope(k)
         q = q.transpose(1, 2)
         k = self.repeat_kv(k).transpose(1, 2)
         v = self.repeat_kv(v).transpose(1, 2)
 
-        # ---------------------------------------------------------
-        # Attention mask
-        # ---------------------------------------------------------
-
         attn_mask = None
         is_causal = attention_mask is None
-
         if attention_mask is not None:
-
             if attention_mask.shape != (b, t):
-                raise ValueError(
-                    f"attention_mask must have shape {(b, t)}"
-                )
-
+                raise ValueError(f"attention_mask must have shape {(b, t)}")
             if attention_mask.device != x.device:
-                attention_mask = attention_mask.to(
-                    device=x.device
-                )
-
+                attention_mask = attention_mask.to(device=x.device)
             if attention_mask.dtype == torch.bool:
                 valid = attention_mask
-
-            elif (
-                attention_mask.is_floating_point()
-                or attention_mask.dtype in (
-                    torch.uint8,
-                    torch.int8,
-                    torch.int16,
-                    torch.int32,
-                    torch.int64,
-                )
+            elif attention_mask.is_floating_point() or attention_mask.dtype in (
+                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
             ):
                 valid = attention_mask != 0
-
             else:
-                raise TypeError(
-                    "attention_mask must be boolean or numeric"
-                )
-
-            causal = torch.ones(
-                (t, t),
-                device=x.device,
-                dtype=torch.bool,
-            ).tril()
-
+                raise TypeError("attention_mask must be boolean or numeric")
+            causal = torch.ones((t, t), device=x.device, dtype=torch.bool).tril()
             attn_mask = (
-                causal[None, None, :, :]
-                & valid[:, None, None, :]
-                & valid[:, None, :, None]
+                causal[None, None, :, :] & valid[:, None, None, :] & valid[:, None, :, None]
             )
-
             is_causal = False
 
-        # ---------------------------------------------------------
-        # SDPA
-        # ---------------------------------------------------------
-
         y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
+            q, k, v,
             attn_mask=attn_mask,
-            dropout_p=(
-                self.attention_dropout
-                if self.training
-                else 0.0
-            ),
+            dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=is_causal,
         )
-
-        # ---------------------------------------------------------
-        # Back to [B,T,D]
-        # ---------------------------------------------------------
-
-        y = (
-            y.transpose(1, 2)
-            .contiguous()
-            .view(
-                b,
-                t,
-                self.hidden_size,
-            )
-        )
-
+        y = y.transpose(1, 2).contiguous().view(b, t, self.hidden_size)
         return self.o_proj(y)
-
-
 
 
 class SwiGLU(nn.Module):
