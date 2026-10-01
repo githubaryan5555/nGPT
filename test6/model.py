@@ -30,6 +30,8 @@ class Config:
     max_seq_len: int = cfg.max_seq_len
     tie_word_embeddings: bool = cfg.tie_word_embeddings
     initializer_range: float = cfg.initializer_range
+    use_multi_token_pred: bool = getattr(cfg, "use_multi_token_pred", False)
+    num_pred_tokens: int = getattr(cfg, "num_pred_tokens", 4)
 
     def __post_init__(self):
         integer_fields = (
@@ -56,6 +58,8 @@ class Config:
             raise ValueError("head_dim must be even for RoPE")
         if self.intermediate_size <= self.hidden_size:
             raise ValueError("intermediate_size must be greater than hidden_size")
+        if self.use_multi_token_pred and self.num_pred_tokens <= 0:
+            raise ValueError("num_pred_tokens must be > 0 when multi-token prediction is enabled")
 
         for name in ("rms_norm_eps", "rope_theta", "initializer_range"):
             value = getattr(self, name)
@@ -67,6 +71,10 @@ class Config:
                 raise ValueError(f"{name} must be finite and in [0, 1)")
         if not isinstance(self.tie_word_embeddings, bool):
             raise TypeError("tie_word_embeddings must be a bool")
+        if not isinstance(self.use_multi_token_pred, bool):
+            raise TypeError("use_multi_token_pred must be a bool")
+        if isinstance(self.num_pred_tokens, bool) or not isinstance(self.num_pred_tokens, int):
+            raise TypeError("num_pred_tokens must be an int")
 
     @property
     def head_dim(self):
@@ -228,6 +236,18 @@ class Model5555LM(nn.Module):
         self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Multi-token prediction heads.
+        if config.use_multi_token_pred:
+            self.future_pos_embeds = nn.ParameterList([
+                nn.Parameter(torch.randn(1, 1, config.hidden_size) * config.initializer_range)
+                for _ in range(config.num_pred_tokens)
+            ])
+            self.draft_projections = nn.ParameterList([
+                nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+                for _ in range(config.num_pred_tokens)
+            ])
+
         self.apply(self._init_weights)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -235,6 +255,9 @@ class Model5555LM(nn.Module):
         for layer in self.layers:
             nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
             nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
+        if config.use_multi_token_pred:
+            for proj in self.draft_projections:
+                nn.init.normal_(proj.weight, std=residual_std)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -275,13 +298,34 @@ class Model5555LM(nn.Module):
                 raise TypeError("attention_mask must be boolean or numeric")
         if input_ids.min() < 0 or input_ids.max() >= self.config.vocab_size:
             raise ValueError(f"input_ids contains a token outside [0, {self.config.vocab_size})")
+
         x = self.embed_dropout(self.embed_tokens(input_ids))
         hidden_states = [] if output_hidden_states else None
         for layer in self.layers:
             x = layer(x, attention_mask)
             if output_hidden_states:
                 hidden_states.append(x)
-        logits = self.lm_head(self.final_layernorm(x))
+
+        h = self.final_layernorm(x)
+        if self.config.use_multi_token_pred:
+            # Stage 1: fully parallel draft predictions for offsets t+1..t+4.
+            drafts = []
+            for i in range(self.config.num_pred_tokens):
+                drafts.append(h + self.future_pos_embeds[i])
+
+            # Stage 2: parallel refinement. Each branch sees the shared hidden state
+            # and a neighboring draft, but the branches still execute in parallel.
+            refined = []
+            for i in range(self.config.num_pred_tokens):
+                draft = drafts[0] if i == 0 else drafts[i - 1]
+                refined.append(h + self.draft_projections[i](draft))
+
+            logits = torch.stack([self.lm_head(r) for r in refined], dim=1)
+            if output_hidden_states:
+                return logits, hidden_states
+            return logits
+
+        logits = self.lm_head(h)
         if output_hidden_states:
             return logits, hidden_states
         return logits
@@ -312,7 +356,10 @@ class Model5555LM(nn.Module):
         head_dim = d // h
         projection = 2 * (d*d + 2*d*kv*head_dim)
         mlp = 6 * d * f
-        return layers * (projection + mlp + 4 * seq_len * d) + 2 * d * v
+        flops = layers * (projection + mlp + 4 * seq_len * d) + 2 * d * v
+        if self.config.use_multi_token_pred:
+            flops += self.config.num_pred_tokens * d * d
+        return flops
 
     def estimate_mfu(self, tokens_per_second, peak_flops):
         for name, value in (("tokens_per_second", tokens_per_second), ("peak_flops", peak_flops)):
@@ -367,7 +414,11 @@ class Model5555LM(nn.Module):
         try:
             for _ in range(max_new_tokens):
                 context = output_ids[:, -self.config.max_seq_len:]
-                logits = self(context)[:, -1, :]
+                logits = self(context)
+                if self.config.use_multi_token_pred:
+                    logits = logits[:, 0, -1, :]
+                else:
+                    logits = logits[:, -1, :]
                 if not do_sample:
                     next_token = logits.argmax(dim=-1, keepdim=True)
                 else:
