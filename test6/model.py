@@ -180,7 +180,11 @@ class GQAAttention(nn.Module):
 
 
 
-class SwiGLU(nn.Module):
+                      
+        
+    
+    
+ class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
 
@@ -190,8 +194,9 @@ class SwiGLU(nn.Module):
         self.num_experts = 8
         self.top_k = 4
 
-        # Each expert is 1/8 of the original SwiGLU.
-        self.expert_intermediate = config.intermediate_size // self.num_experts
+        self.expert_intermediate = (
+            config.intermediate_size // self.num_experts
+        )
 
         # Tiny sequence-level router.
         self.router = nn.Linear(
@@ -200,51 +205,54 @@ class SwiGLU(nn.Module):
             bias=False,
         )
 
-        # Keep these as normal Linear layers so existing initialization
-        # code such as:
-        #
-        # layer.mlp.down_proj.weight
-        #
-        # continues to work.
-        #
-        # The expert dimension is packed into the output dimension.
-        self.gate_proj = nn.Linear(
-            config.hidden_size,
-            self.num_experts * self.expert_intermediate,
-            bias=False,
-        )
+        # 8 small SwiGLU experts.
+        self.gate_proj = nn.ModuleList([
+            nn.Linear(
+                config.hidden_size,
+                self.expert_intermediate,
+                bias=False,
+            )
+            for _ in range(self.num_experts)
+        ])
 
-        self.up_proj = nn.Linear(
-            config.hidden_size,
-            self.num_experts * self.expert_intermediate,
-            bias=False,
-        )
+        self.up_proj = nn.ModuleList([
+            nn.Linear(
+                config.hidden_size,
+                self.expert_intermediate,
+                bias=False,
+            )
+            for _ in range(self.num_experts)
+        ])
 
-        self.down_proj = nn.Linear(
-            self.num_experts * self.expert_intermediate,
-            config.hidden_size,
-            bias=False,
-        )
+        self.down_proj = nn.ModuleList([
+            nn.Linear(
+                self.expert_intermediate,
+                config.hidden_size,
+                bias=False,
+            )
+            for _ in range(self.num_experts)
+        ])
 
     def forward(self, x):
-        # x:
-        # [B, T, H]
+        # x: [B, T, H]
 
         B, T, H = x.shape
-        E = self.num_experts
-        D = self.expert_intermediate
 
         # ---------------------------------------------------------
-        # Sequence-level router
+        # Sequence-level routing
         # ---------------------------------------------------------
 
-        # One representation for the whole sequence.
-        sequence_repr = x.mean(dim=1)                 # [B, H]
+        # One representation for the entire sequence.
+        sequence_repr = x.mean(dim=1)              # [B, H]
 
-        router_logits = self.router(sequence_repr)   # [B, E]
-        router_probs = F.softmax(router_logits, dim=-1)
+        router_logits = self.router(sequence_repr) # [B, 8]
 
-        # Select 4 experts.
+        router_probs = F.softmax(
+            router_logits,
+            dim=-1,
+        )
+
+        # Select 4 experts for each sequence.
         top_values, top_indices = torch.topk(
             router_probs,
             self.top_k,
@@ -253,85 +261,61 @@ class SwiGLU(nn.Module):
 
         # Renormalize selected experts.
         top_values = top_values / (
-            top_values.sum(dim=-1, keepdim=True) + 1e-8
+            top_values.sum(
+                dim=-1,
+                keepdim=True,
+            ) + 1e-8
         )
 
         # ---------------------------------------------------------
-        # Calculate all expert activations in one set of matmuls.
+        # Expert execution
         # ---------------------------------------------------------
 
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
+        output = torch.zeros_like(x)
 
-        # [B, T, E*D] -> [B, T, E, D]
-        gate = gate.view(B, T, E, D)
-        up = up.view(B, T, E, D)
+        # Each selected expert is executed only for the
+        # batch elements that selected it.
+        for expert_id in range(self.num_experts):
 
-        hidden = F.silu(gate) * up
+            # Which sequences selected this expert?
+            mask = (top_indices == expert_id).any(dim=-1)
 
-        # ---------------------------------------------------------
-        # Select the 4 routed experts.
-        # ---------------------------------------------------------
+            if not mask.any():
+                continue
 
-        # [B, T, E, D]
-        #
-        # top_indices:
-        # [B, 4]
-        #
-        # Expand indices across T and D.
-        indices = top_indices[:, None, :, None].expand(
-            B,
-            T,
-            self.top_k,
-            D,
-        )
+            # Batch elements belonging to this expert.
+            x_expert = x[mask]
 
-        selected = torch.gather(
-            hidden,
-            dim=2,
-            index=indices,
-        )
+            # SwiGLU.
+            gate = self.gate_proj[expert_id](x_expert)
+            up = self.up_proj[expert_id](x_expert)
 
-        # ---------------------------------------------------------
-        # Weighted mixture of selected experts.
-        # ---------------------------------------------------------
+            hidden = F.silu(gate) * up
 
-        weights = top_values[:, None, :, None]
+            expert_output = self.down_proj[expert_id](hidden)
 
-        selected = selected * weights
+            # Find this expert's routing weight for each
+            # selected sequence.
+            expert_positions = (
+                top_indices[mask] == expert_id
+            )
 
-        # Sum the 4 selected experts.
-        selected = selected.sum(dim=2)
+            weights = (
+                top_values[mask]
+                * expert_positions.to(top_values.dtype)
+            ).sum(dim=-1)
 
-        # ---------------------------------------------------------
-        # Down projection
-        # ---------------------------------------------------------
+            weights = weights.view(
+                -1,
+                1,
+                1,
+            )
 
-        # IMPORTANT:
-        #
-        # Because down_proj is packed as one Linear, its input expects
-        # the full E*D dimension.
-        #
-        # Put the selected expert activations back into their original
-        # expert slots, with inactive experts set to zero.
-        packed = torch.zeros(
-            B,
-            T,
-            E,
-            D,
-            device=x.device,
-            dtype=x.dtype,
-        )
+            output[mask] += expert_output * weights
 
-        packed.scatter_add_(
-            2,
-            indices,
-            selected.unsqueeze(2),
-        )
+        return output
 
-        packed = packed.reshape(B, T, E * D)
 
-        return self.down_proj(packed)
 
 
 
