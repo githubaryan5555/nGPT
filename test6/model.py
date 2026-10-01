@@ -1,4 +1,4 @@
-vf"""Small decoder-only language model used by ``train.py``."""
+"""Small decoder-only language model used by ``train.py``."""
 
 from dataclasses import asdict, dataclass
 import math
