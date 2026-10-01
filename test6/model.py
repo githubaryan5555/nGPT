@@ -179,21 +179,15 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
-
-
-import torch.nn as nn
-import torch.nn.functional as F
-
 class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        # Single up-projection to match traditional MLP behavior
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        # 1 Linear up-projection -> GELU activation -> 1 Linear down-projection
-        return self.down_proj(F.gelu(self.up_proj(x)))
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Block(nn.Module):
