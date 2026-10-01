@@ -115,13 +115,18 @@ class RoPE(nn.Module):
         return torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1).flatten(-2)
 
 
+
+
 class GQAAttention(nn.Module):
     """
-    GQA with low-rank K/V projections.
+    GQA + shared query heads.
 
-    Q remains full-size.
-    K/V are projected through a smaller latent dimension before
-    being expanded into KV heads.
+    Example:
+        num_attention_heads = 16
+        num_key_value_heads = 4
+
+    Instead of 16 independent Q projections, this creates
+    4 Q projections and shares each Q across 4 query heads.
 
     No Config changes required.
     """
@@ -136,46 +141,39 @@ class GQAAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.attention_dropout = config.attention_dropout
 
-        # Keep Q unchanged.
+        # Number of unique query projections.
+        #
+        # Example:
+        #   16 Q heads / 4 KV heads = 4 unique Q heads
+        #
+        self.num_query_groups = config.num_key_value_heads
+
+        # ---------------------------------------------------------
+        # Shared Q projection
+        #
+        # Normal GQA:
+        #   hidden -> 16 * head_dim
+        #
+        # Here:
+        #   hidden -> 4 * head_dim
+        #
+        # Each Q head is then repeated inside its group.
+        # ---------------------------------------------------------
         self.q_proj = nn.Linear(
             config.hidden_size,
-            config.num_attention_heads * config.head_dim,
-            bias=False,
-        )
-
-        # ---------------------------------------------------------
-        # Low-rank KV bottleneck.
-        #
-        # Instead of:
-        #
-        #   hidden -> KV heads
-        #
-        # we do:
-        #
-        #   hidden -> small latent -> KV heads
-        # ---------------------------------------------------------
-
-        full_kv_dim = config.num_key_value_heads * config.head_dim
-
-        # No Config modification needed.
-        # Start with 50% of the normal KV dimension.
-        self.kv_latent_dim = max(1, full_kv_dim // 2)
-
-        self.kv_down = nn.Linear(
-            config.hidden_size,
-            self.kv_latent_dim,
+            self.num_query_groups * config.head_dim,
             bias=False,
         )
 
         self.k_proj = nn.Linear(
-            self.kv_latent_dim,
-            full_kv_dim,
+            config.hidden_size,
+            config.num_key_value_heads * config.head_dim,
             bias=False,
         )
 
         self.v_proj = nn.Linear(
-            self.kv_latent_dim,
-            full_kv_dim,
+            config.hidden_size,
+            config.num_key_value_heads * config.head_dim,
             bias=False,
         )
 
@@ -191,84 +189,138 @@ class GQAAttention(nn.Module):
             config.rope_theta,
         )
 
+    def repeat_q(self, x):
+        """
+        x:
+            [B, T, query_groups, D]
+
+        returns:
+            [B, T, num_attention_heads, D]
+        """
+
+        if self.num_queries_per_kv == 1:
+            return x
+
+        b, t, groups, d = x.shape
+
+        return (
+            x[:, :, :, None, :]
+            .expand(
+                b,
+                t,
+                groups,
+                self.num_queries_per_kv,
+                d,
+            )
+            .reshape(
+                b,
+                t,
+                self.num_attention_heads,
+                d,
+            )
+        )
+
     def repeat_kv(self, x):
+        """
+        x:
+            [B, T, KV_heads, D]
+
+        returns:
+            [B, T, attention_heads, D]
+        """
+
         if self.num_queries_per_kv == 1:
             return x
 
         b, t, kv_heads, d = x.shape
 
-        return x[:, :, :, None, :].expand(
-            b,
-            t,
-            kv_heads,
-            self.num_queries_per_kv,
-            d,
-        ).reshape(
-            b,
-            t,
-            self.num_attention_heads,
-            d,
+        return (
+            x[:, :, :, None, :]
+            .expand(
+                b,
+                t,
+                kv_heads,
+                self.num_queries_per_kv,
+                d,
+            )
+            .reshape(
+                b,
+                t,
+                self.num_attention_heads,
+                d,
+            )
         )
 
     def forward(self, x, attention_mask=None):
         b, t, _ = x.shape
 
         # ---------------------------------------------------------
-        # Query remains full dimensional.
+        # Q
+        #
+        # Only generate one Q per KV group.
         # ---------------------------------------------------------
 
         q = self.q_proj(x).view(
             b,
             t,
-            self.num_attention_heads,
+            self.num_query_groups,
             self.head_dim,
         )
 
+        # Share each Q across its group.
+        q = self.repeat_q(q)
+
         # ---------------------------------------------------------
-        # Low-rank KV path.
-        #
-        # X -> latent -> K/V
+        # K / V
         # ---------------------------------------------------------
 
-        kv_latent = self.kv_down(x)
-
-        k = self.k_proj(kv_latent).view(
+        k = self.k_proj(x).view(
             b,
             t,
             self.num_key_value_heads,
             self.head_dim,
         )
 
-        v = self.v_proj(kv_latent).view(
+        v = self.v_proj(x).view(
             b,
             t,
             self.num_key_value_heads,
             self.head_dim,
         )
 
-        # RoPE.
-        q, k = self.rope(q), self.rope(k)
+        # ---------------------------------------------------------
+        # RoPE
+        # ---------------------------------------------------------
 
-        # [B, T, H, D] -> [B, H, T, D]
+        q = self.rope(q)
+        k = self.rope(k)
+
+        # ---------------------------------------------------------
+        # [B,T,H,D] -> [B,H,T,D]
+        # ---------------------------------------------------------
+
         q = q.transpose(1, 2)
         k = self.repeat_kv(k).transpose(1, 2)
         v = self.repeat_kv(v).transpose(1, 2)
 
         # ---------------------------------------------------------
-        # Attention mask handling.
+        # Attention mask
         # ---------------------------------------------------------
 
         attn_mask = None
         is_causal = attention_mask is None
 
         if attention_mask is not None:
+
             if attention_mask.shape != (b, t):
                 raise ValueError(
                     f"attention_mask must have shape {(b, t)}"
                 )
 
             if attention_mask.device != x.device:
-                attention_mask = attention_mask.to(device=x.device)
+                attention_mask = attention_mask.to(
+                    device=x.device
+                )
 
             if attention_mask.dtype == torch.bool:
                 valid = attention_mask
@@ -305,7 +357,7 @@ class GQAAttention(nn.Module):
             is_causal = False
 
         # ---------------------------------------------------------
-        # SDPA.
+        # SDPA
         # ---------------------------------------------------------
 
         y = F.scaled_dot_product_attention(
@@ -321,11 +373,18 @@ class GQAAttention(nn.Module):
             is_causal=is_causal,
         )
 
-        # [B, H, T, D] -> [B, T, H*D]
+        # ---------------------------------------------------------
+        # Back to [B,T,D]
+        # ---------------------------------------------------------
+
         y = (
             y.transpose(1, 2)
             .contiguous()
-            .view(b, t, self.hidden_size)
+            .view(
+                b,
+                t,
+                self.hidden_size,
+            )
         )
 
         return self.o_proj(y)
