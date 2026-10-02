@@ -179,7 +179,6 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
-
 class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -211,14 +210,12 @@ class SwiGLU(nn.Module):
             for _ in range(self.num_leaves)
         ])
 
-        self.down_proj = nn.ModuleList([
-            nn.Linear(
-                config.intermediate_size,
-                config.hidden_size,
-                bias=False,
-            )
-            for _ in range(self.num_leaves)
-        ])
+        # Shared output projection.
+        self.down_proj = nn.Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=False,
+        )
 
     def forward(self, x):
         original_shape = x.shape
@@ -228,7 +225,12 @@ class SwiGLU(nn.Module):
         routes = self.router(x)
         indices = routes.argmax(dim=-1)
 
-        output = torch.empty_like(x)
+        output = torch.empty(
+            x.size(0),
+            self.hidden_size,
+            device=x.device,
+            dtype=x.dtype,
+        )
 
         for i in range(self.num_leaves):
             mask = indices == i
@@ -236,15 +238,14 @@ class SwiGLU(nn.Module):
             if mask.any():
                 xi = x[mask]
 
-                value = self.down_proj[i](
+                hidden = (
                     F.silu(self.gate_proj[i](xi))
                     * self.up_proj[i](xi)
                 )
 
-                output[mask] = value
+                output[mask] = self.down_proj(hidden)
 
         return output.reshape(original_shape)
-
 
 class Block(nn.Module):
     def __init__(self, config: Config):
