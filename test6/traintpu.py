@@ -1,8 +1,7 @@
-"""PyTorch/XLA trainer for Model5555LM."""
+"""PyTorch/XLA TPU trainer for Model5555LM."""
 
 import argparse
 import glob
-import json
 import math
 import os
 import re
@@ -48,7 +47,9 @@ def apply_cli():
         old = getattr(cfg, name)
 
         if isinstance(old, bool):
-            value = value.lower() in {"1", "true", "yes", "on"}
+            value = value.lower() in {
+                "1", "true", "yes", "on"
+            }
         elif isinstance(old, int) and not isinstance(old, bool):
             value = int(value)
         elif isinstance(old, float):
@@ -72,34 +73,46 @@ apply_cli()
 # XLA DEVICE
 # ============================================================
 
-device = xm.xla_device()
+device = torch_xla.device()
 device_type = "xla"
 
-# XLA generally uses bfloat16 on TPU.
+# TPU v5e: BF16 is preferred.
 dtype_name = getattr(cfg, "dtype", "bfloat16")
 
 if dtype_name == "float32":
     ptdtype = torch.float32
-elif dtype_name == "bfloat16":
-    ptdtype = torch.bfloat16
+    ctx = nullcontext()
 else:
-    # TPU training should normally use BF16 rather than FP16.
-    print(f"warning: XLA trainer replacing dtype={dtype_name} with bfloat16")
     dtype_name = "bfloat16"
     ptdtype = torch.bfloat16
-
-ctx = (
-    torch.autocast(device_type="xla", dtype=ptdtype)
-    if dtype_name != "float32"
-    else nullcontext()
-)
+    ctx = torch.autocast(
+        device_type="xla",
+        dtype=torch.bfloat16,
+    )
 
 master_process = xm.is_master_ordinal(local=False)
 
-dataset_dtype = np.dtype(cfg.dataset_dtype)
 
-if dataset_dtype.kind not in "iu":
-    raise ValueError("dataset_dtype must be an integer NumPy dtype")
+# ============================================================
+# MEMORY REPORT
+# ============================================================
+
+def report_memory(tag):
+    xm.mark_step()
+
+    m = xm.get_memory_info(device)
+
+    used = m["bytes_used"] / (1024 ** 3)
+    peak = m["peak_bytes_used"] / (1024 ** 3)
+    limit = m["bytes_limit"] / (1024 ** 3)
+
+    if master_process:
+        print(
+            f"[TPU] {tag} | "
+            f"used={used:.3f} GiB | "
+            f"peak={peak:.3f} GiB | "
+            f"limit={limit:.3f} GiB"
+        )
 
 
 # ============================================================
@@ -118,9 +131,19 @@ tokens_per_step = (
 if master_process:
     os.makedirs(cfg.out_dir, exist_ok=True)
 
+    print("=" * 60)
+    print("TPU TRAINING")
+    print("=" * 60)
     print(f"device={device}")
     print(f"dtype={dtype_name}")
-    print(f"tokens per optimizer step={tokens_per_step:,}")
+    print(f"batch_size={batch_size}")
+    print(
+        f"gradient_accumulation_steps="
+        f"{cfg.gradient_accumulation_steps}"
+    )
+    print(f"seq_len={max_seq_len}")
+    print(f"tokens/optimizer_step={tokens_per_step:,}")
+    print("=" * 60)
 
 
 torch.manual_seed(cfg.seed)
@@ -130,15 +153,25 @@ torch.manual_seed(cfg.seed)
 # DATA
 # ============================================================
 
+dataset_dtype = np.dtype(cfg.dataset_dtype)
+
+if dataset_dtype.kind not in "iu":
+    raise ValueError(
+        "dataset_dtype must be an integer NumPy dtype"
+    )
+
+
 class TokenBatches:
 
     def __init__(self):
+
         self.maps = {}
 
         for split, path in (
             ("train", cfg.train_bin),
             ("val", cfg.val_bin),
         ):
+
             if not os.path.isfile(path):
                 raise FileNotFoundError(path)
 
@@ -150,12 +183,14 @@ class TokenBatches:
 
             if len(data) <= max_seq_len:
                 raise ValueError(
-                    f"{path} must contain more than max_seq_len tokens"
+                    f"{path} must contain more "
+                    f"than max_seq_len tokens"
                 )
 
             self.maps[split] = data
 
     def get(self, split):
+
         data = self.maps[split]
 
         starts = torch.randint(
@@ -177,16 +212,16 @@ class TokenBatches:
             dtype=np.int64,
         )
 
+        # CPU tensors.
+        #
+        # Do NOT move these to TPU here.
         x = torch.from_numpy(
             windows[:, :-1].copy()
-        )
+        ).long()
 
         y = torch.from_numpy(
             windows[:, 1:].copy()
-        )
-
-        x = x.to(device)
-        y = y.to(device)
+        ).long()
 
         return x, y
 
@@ -195,7 +230,7 @@ batches = TokenBatches()
 
 
 # ============================================================
-# MODEL
+# MODEL CONFIG
 # ============================================================
 
 def model_values():
@@ -340,15 +375,37 @@ else:
     model = make_model()
 
 
+# ------------------------------------------------------------
+# Move model to TPU.
+# ------------------------------------------------------------
+
 model.to(device)
+
+# Important:
+# We let autocast handle BF16 computation rather than
+# permanently converting every parameter to BF16.
+#
+# AdamW optimizer states remain FP32 where appropriate.
 
 
 if master_process and cfg.print_model_info:
 
     print(
-        f"parameters={model.get_num_params():,}, "
-        f"model size={model.get_model_size_mb():.8g} MB"
+        f"parameters={model.get_num_params():,}"
     )
+
+    print(
+        f"model size BF16="
+        f"{model.get_model_size_mb(2):.2f} MB"
+    )
+
+    print(
+        f"model size FP32="
+        f"{model.get_model_size_mb(4):.2f} MB"
+    )
+
+
+report_memory("after model")
 
 
 # ============================================================
@@ -388,26 +445,43 @@ optimizer = torch.optim.AdamW(
 )
 
 
-if checkpoint is not None and "optimizer" in checkpoint:
+if (
+    checkpoint is not None
+    and "optimizer" in checkpoint
+):
     optimizer.load_state_dict(
         checkpoint["optimizer"]
     )
 
 
 # ============================================================
-# XLA COMPILE
+# OPTIONAL COMPILE
 # ============================================================
 
-# torch.compile is optional on XLA.
-if getattr(cfg, "compile_model", False):
+compile_enabled = getattr(
+    cfg,
+    "compile_model",
+    False,
+)
+
+if compile_enabled:
 
     if master_process:
-        print("torch.compile enabled")
+        print(
+            "torch.compile/openxla enabled"
+        )
 
     model = torch.compile(
         model,
         backend="openxla",
     )
+
+else:
+
+    if master_process:
+        print(
+            "torch.compile disabled"
+        )
 
 
 raw_model = model
@@ -417,7 +491,10 @@ raw_model = model
 # LOSS
 # ============================================================
 
-def language_loss(logits, targets):
+def language_loss(
+    logits,
+    targets,
+):
 
     return F.cross_entropy(
         logits.reshape(
@@ -444,15 +521,23 @@ def estimate_loss():
 
     for split in ("train", "val"):
 
-        total = torch.zeros(
-            (),
-            device=device,
-            dtype=torch.float32,
-        )
+        total = 0.0
 
         for _ in range(cfg.eval_iters):
 
-            x, y = batches.get(split)
+            x_cpu, y_cpu = (
+                batches.get(split)
+            )
+
+            x = x_cpu.to(
+                device=device,
+                dtype=torch.long,
+            )
+
+            y = y_cpu.to(
+                device=device,
+                dtype=torch.long,
+            )
 
             with ctx:
 
@@ -463,18 +548,29 @@ def estimate_loss():
                     y,
                 )
 
-            total += value.detach()
+            # Bring only the scalar to CPU.
+            total += float(
+                value.float().item()
+            )
+
+            del logits
+            del value
+            del x
+            del y
+            del x_cpu
+            del y_cpu
 
             xm.mark_step()
 
-        total /= cfg.eval_iters
-
-        # Get scalar back to CPU.
-        total_value = total.item()
-
-        totals[split] = total_value
+        totals[split] = (
+            total / cfg.eval_iters
+        )
 
     model.train()
+
+    report_memory(
+        f"after {split} evaluation"
+    )
 
     return totals
 
@@ -501,7 +597,10 @@ def get_lr(step):
 
     ratio = (
         (step - cfg.warmup_iters)
-        / (cfg.lr_decay_iters - cfg.warmup_iters)
+        / (
+            cfg.lr_decay_iters
+            - cfg.warmup_iters
+        )
     )
 
     return (
@@ -521,25 +620,36 @@ def get_lr(step):
 
 tokenizer = None
 
-if os.path.isfile(cfg.tokenizer_path):
+if os.path.isfile(
+    cfg.tokenizer_path
+):
 
     try:
 
         from tokenizers import Tokenizer
 
-        backend_tokenizer = Tokenizer.from_file(
-            cfg.tokenizer_path
+        backend_tokenizer = (
+            Tokenizer.from_file(
+                cfg.tokenizer_path
+            )
         )
 
         class TokenizerAdapter:
 
             def encode(self, text):
-                return backend_tokenizer.encode(text).ids
+                return (
+                    backend_tokenizer
+                    .encode(text)
+                    .ids
+                )
 
             def decode(self, ids):
-                return backend_tokenizer.decode(
-                    ids,
-                    skip_special_tokens=True,
+                return (
+                    backend_tokenizer
+                    .decode(
+                        ids,
+                        skip_special_tokens=True,
+                    )
                 )
 
         tokenizer = TokenizerAdapter()
@@ -548,7 +658,8 @@ if os.path.isfile(cfg.tokenizer_path):
 
         if master_process:
             print(
-                f"warning: tokenizer unavailable ({exc})"
+                f"warning: tokenizer unavailable "
+                f"({exc})"
             )
 
 
@@ -558,7 +669,10 @@ if os.path.isfile(cfg.tokenizer_path):
 
 def sample_text():
 
-    if tokenizer is None or not master_process:
+    if (
+        tokenizer is None
+        or not master_process
+    ):
         return
 
     was_training = raw_model.training
@@ -567,9 +681,13 @@ def sample_text():
 
     print("samples:")
 
-    for number in range(cfg.sample_count):
+    for number in range(
+        cfg.sample_count
+    ):
 
-        source, _ = batches.get("val")
+        source, _ = batches.get(
+            "val"
+        )
 
         prompt_ids = source[
             0,
@@ -577,7 +695,7 @@ def sample_text():
                 cfg.sample_prompt_tokens,
                 max_seq_len,
             ),
-        ].cpu().tolist()
+        ].tolist()
 
         prompt = tokenizer.decode(
             prompt_ids
@@ -588,15 +706,20 @@ def sample_text():
             output = raw_model.generate(
                 prompt,
                 tokenizer,
-                max_new_tokens=cfg.sample_new_tokens,
-                temperature=cfg.sample_temperature,
+                max_new_tokens=(
+                    cfg.sample_new_tokens
+                ),
+                temperature=(
+                    cfg.sample_temperature
+                ),
                 top_k=cfg.sample_top_k,
                 top_p=cfg.sample_top_p,
                 eos_token_id=cfg.eos_token_id,
             )
 
             print(
-                f"  [{number + 1}] {output}"
+                f"  [{number + 1}] "
+                f"{output}"
             )
 
         except Exception as exc:
@@ -606,7 +729,9 @@ def sample_text():
                 f"generation failed: {exc}"
             )
 
-    raw_model.train(was_training)
+    raw_model.train(
+        was_training
+    )
 
     xm.mark_step()
 
@@ -615,7 +740,10 @@ def sample_text():
 # CHECKPOINT SAVE
 # ============================================================
 
-def save_checkpoint(step, val_loss):
+def save_checkpoint(
+    step,
+    val_loss,
+):
 
     if not master_process:
         return
@@ -623,12 +751,15 @@ def save_checkpoint(step, val_loss):
     if not cfg.save_checkpoint:
         return
 
-    # Ensure all XLA operations are complete.
     xm.mark_step()
 
+    # Move state to CPU immediately.
     state_dict = {
-        key.removeprefix("_orig_mod."): value.cpu()
-        for key, value in raw_model.state_dict().items()
+        key.removeprefix(
+            "_orig_mod."
+        ): value.cpu()
+        for key, value
+        in raw_model.state_dict().items()
     }
 
     payload = {
@@ -681,6 +812,9 @@ def save_checkpoint(step, val_loss):
         latest,
     )
 
+    del state_dict
+    del payload
+
     print(
         f"saved checkpoint: {path}"
     )
@@ -690,9 +824,11 @@ def save_checkpoint(step, val_loss):
 # TRAINING
 # ============================================================
 
+# CPU batch.
 X, Y = batches.get("train")
 
 last_time = time.perf_counter()
+
 
 while iter_num < cfg.max_iters:
 
@@ -701,11 +837,15 @@ while iter_num < cfg.max_iters:
     for group in optimizer.param_groups:
         group["lr"] = lr
 
+
     # --------------------------------------------------------
     # Evaluation
     # --------------------------------------------------------
 
-    if iter_num % cfg.eval_interval == 0:
+    if (
+        iter_num % cfg.eval_interval
+        == 0
+    ):
 
         losses = estimate_loss()
 
@@ -713,9 +853,11 @@ while iter_num < cfg.max_iters:
 
             print(
                 f"step={iter_num:06d} "
-                f"train_loss={losses['train']:.16g} "
-                f"val_loss={losses['val']:.16g} "
-                f"lr={lr:.16g}"
+                f"train_loss="
+                f"{losses['train']:.8f} "
+                f"val_loss="
+                f"{losses['val']:.8f} "
+                f"lr={lr:.8g}"
             )
 
             sample_text()
@@ -726,7 +868,9 @@ while iter_num < cfg.max_iters:
             )
 
             if improved:
-                best_val_loss = losses["val"]
+                best_val_loss = (
+                    losses["val"]
+                )
 
             if (
                 iter_num > 0
@@ -735,13 +879,19 @@ while iter_num < cfg.max_iters:
                     or cfg.always_save_checkpoint
                 )
             ):
+
                 save_checkpoint(
                     iter_num,
                     best_val_loss,
                 )
 
-    if iter_num == 0 and cfg.eval_only:
+
+    if (
+        iter_num == 0
+        and cfg.eval_only
+    ):
         break
+
 
     # --------------------------------------------------------
     # Gradient accumulation
@@ -757,13 +907,34 @@ while iter_num < cfg.max_iters:
         cfg.gradient_accumulation_steps
     ):
 
+        # ----------------------------------------------------
+        # Move ONLY current batch to TPU.
+        # ----------------------------------------------------
+
+        x = X.to(
+            device=device,
+            dtype=torch.long,
+        )
+
+        y = Y.to(
+            device=device,
+            dtype=torch.long,
+        )
+
+
+        # ----------------------------------------------------
+        # Forward
+        # ----------------------------------------------------
+
         with ctx:
 
-            logits = model(X)
+            logits = model(x)
 
-            micro_loss = language_loss(
-                logits,
-                Y,
+            micro_loss = (
+                language_loss(
+                    logits,
+                    y,
+                )
             )
 
             loss = (
@@ -771,18 +942,56 @@ while iter_num < cfg.max_iters:
                 / cfg.gradient_accumulation_steps
             )
 
-        step_loss_sum += (
+
+        # ----------------------------------------------------
+        # CPU scalar for logging.
+        # ----------------------------------------------------
+
+        step_loss_sum += float(
             micro_loss.detach()
             .float()
             .item()
         )
 
+
+        # ----------------------------------------------------
+        # Backward
+        # ----------------------------------------------------
+
         loss.backward()
 
-        X, Y = batches.get("train")
 
-        # Tell XLA that this section can be lowered.
+        # ----------------------------------------------------
+        # Release forward references.
+        # ----------------------------------------------------
+
+        del logits
+        del micro_loss
+        del loss
+        del x
+        del y
+
+
+        # ----------------------------------------------------
+        # Prepare next CPU batch.
+        # ----------------------------------------------------
+
+        if (
+            micro_step + 1
+            < cfg.gradient_accumulation_steps
+        ):
+
+            X, Y = batches.get(
+                "train"
+            )
+
+
+        # ----------------------------------------------------
+        # Execute XLA graph.
+        # ----------------------------------------------------
+
         xm.mark_step()
+
 
     # --------------------------------------------------------
     # Gradient clipping
@@ -795,18 +1004,31 @@ while iter_num < cfg.max_iters:
             cfg.grad_clip,
         )
 
+
     # --------------------------------------------------------
-    # XLA optimizer step
+    # Optimizer
     # --------------------------------------------------------
 
     xm.optimizer_step(
         optimizer,
-        barrier=True,
+        barrier=False,
     )
 
     optimizer.zero_grad(
         set_to_none=True
     )
+
+    xm.mark_step()
+
+
+    # --------------------------------------------------------
+    # Next batch
+    # --------------------------------------------------------
+
+    X, Y = batches.get(
+        "train"
+    )
+
 
     # --------------------------------------------------------
     # Metrics
@@ -825,19 +1047,26 @@ while iter_num < cfg.max_iters:
 
     last_time = now
 
+
     if (
-        iter_num % cfg.log_interval == 0
+        iter_num % cfg.log_interval
+        == 0
         and master_process
     ):
 
         tokens_per_second = (
             tokens_per_step
-            / max(elapsed, 1e-9)
+            / max(
+                elapsed,
+                1e-9,
+            )
         )
 
         try:
+
             flops_per_token = (
-                raw_model.get_flops_per_token(
+                raw_model
+                .get_flops_per_token(
                     max_seq_len
                 )
             )
@@ -854,12 +1083,32 @@ while iter_num < cfg.max_iters:
 
         print(
             f"iter={iter_num:06d} "
-            f"loss={average_step_loss:.16g} "
-            f"time={elapsed:.8g}s "
-            f"tokens/s={tokens_per_second:.8g} "
-            f"FLOP/token={flops_per_token:.8g} "
-            f"FLOP/s={flops_per_second:.8g}"
+            f"loss={average_step_loss:.8f} "
+            f"time={elapsed:.4f}s "
+            f"tokens/s="
+            f"{tokens_per_second:.2f} "
+            f"FLOP/token="
+            f"{flops_per_token:.4g} "
+            f"FLOP/s="
+            f"{flops_per_second:.4g}"
         )
+
+
+    # --------------------------------------------------------
+    # Memory reporting.
+    # --------------------------------------------------------
+
+    if (
+        iter_num == 0
+        or (
+            iter_num % cfg.log_interval
+            == 0
+        )
+    ):
+        report_memory(
+            f"after step {iter_num}"
+        )
+
 
     iter_num += 1
 
@@ -873,6 +1122,7 @@ if (
     and cfg.save_checkpoint
     and iter_num > 0
 ):
+
     save_checkpoint(
         iter_num,
         best_val_loss,
@@ -880,3 +1130,5 @@ if (
 
 
 xm.mark_step()
+
+report_memory("final")
