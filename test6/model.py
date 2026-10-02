@@ -182,70 +182,13 @@ class GQAAttention(nn.Module):
 class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-
-        self.hidden_size = config.hidden_size
-        self.num_leaves = 8
-
-        self.router = nn.Linear(
-            config.hidden_size,
-            self.num_leaves,
-            bias=False,
-        )
-
-        self.gate_proj = nn.ModuleList([
-            nn.Linear(
-                config.hidden_size,
-                config.intermediate_size,
-                bias=False,
-            )
-            for _ in range(self.num_leaves)
-        ])
-
-        self.up_proj = nn.ModuleList([
-            nn.Linear(
-                config.hidden_size,
-                config.intermediate_size,
-                bias=False,
-            )
-            for _ in range(self.num_leaves)
-        ])
-
-        # Shared output projection.
-        self.down_proj = nn.Linear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-        )
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        original_shape = x.shape
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
-        x = x.reshape(-1, self.hidden_size)
-
-        routes = self.router(x)
-        indices = routes.argmax(dim=-1)
-
-        output = torch.empty(
-            x.size(0),
-            self.hidden_size,
-            device=x.device,
-            dtype=x.dtype,
-        )
-
-        for i in range(self.num_leaves):
-            mask = indices == i
-
-            if mask.any():
-                xi = x[mask]
-
-                hidden = (
-                    F.silu(self.gate_proj[i](xi))
-                    * self.up_proj[i](xi)
-                )
-
-                output[mask] = self.down_proj(hidden)
-
-        return output.reshape(original_shape)
 
 class Block(nn.Module):
     def __init__(self, config: Config):
