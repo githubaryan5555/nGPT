@@ -198,14 +198,13 @@ class Block(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = SwiGLU(config)
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
-
+        self.attn_scale = nn.Parameter(torch.zeros(1))
+        self.mlp_scale = nn.Parameter(torch.zeros(1))
+        
+        
     def forward(self, x, attention_mask=None):
-        x = x + self.hidden_dropout(
-            self.self_attn(self.input_layernorm(x), attention_mask)
-        )
-        x = x + self.hidden_dropout(
-            self.mlp(self.post_attention_layernorm(x))
-        )
+        x = x + self.attn_scale * self.hidden_dropout(self.self_attn(self.input_layernorm(x), attention_mask))
+        x = x + self.mlp_scale * self.hidden_dropout(self.mlp(self.post_attention_layernorm(x)))
         return x
 
 
