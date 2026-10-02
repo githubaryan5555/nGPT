@@ -185,44 +185,65 @@ class SwiGLU(nn.Module):
         super().__init__()
 
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-
-        # Number of leaf SwiGLUs.
         self.num_leaves = 8
 
-        # Hierarchical binary router.
         self.router = nn.Linear(
             config.hidden_size,
             self.num_leaves,
             bias=False,
         )
 
-        self.experts = nn.ModuleList([
-            SwiGLU(config)
+        self.gate_proj = nn.ModuleList([
+            nn.Linear(
+                config.hidden_size,
+                config.intermediate_size,
+                bias=False,
+            )
+            for _ in range(self.num_leaves)
+        ])
+
+        self.up_proj = nn.ModuleList([
+            nn.Linear(
+                config.hidden_size,
+                config.intermediate_size,
+                bias=False,
+            )
+            for _ in range(self.num_leaves)
+        ])
+
+        self.down_proj = nn.ModuleList([
+            nn.Linear(
+                config.intermediate_size,
+                config.hidden_size,
+                bias=False,
+            )
             for _ in range(self.num_leaves)
         ])
 
     def forward(self, x):
-        # x: [batch, sequence, hidden]
         original_shape = x.shape
 
-        flat_x = x.reshape(-1, self.hidden_size)
+        x = x.reshape(-1, self.hidden_size)
 
-        # Choose one leaf for each token.
-        route = self.router(flat_x)
-        indices = route.argmax(dim=-1)
+        routes = self.router(x)
+        indices = routes.argmax(dim=-1)
 
-        output = torch.empty_like(flat_x)
+        output = torch.empty_like(x)
 
-        # Only execute the selected SwiGLU for each token.
-        for i, expert in enumerate(self.experts):
+        for i in range(self.num_leaves):
             mask = indices == i
 
             if mask.any():
-                output[mask] = expert(flat_x[mask])
+                xi = x[mask]
+
+                value = self.down_proj[i](
+                    F.silu(self.gate_proj[i](xi))
+                    * self.up_proj[i](xi)
+                )
+
+                output[mask] = value
 
         return output.reshape(original_shape)
-
 
 
 class Block(nn.Module):
