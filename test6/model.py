@@ -179,15 +179,50 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
+
 class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+
+        # Number of leaf SwiGLUs.
+        self.num_leaves = 8
+
+        # Hierarchical binary router.
+        self.router = nn.Linear(
+            config.hidden_size,
+            self.num_leaves,
+            bias=False,
+        )
+
+        self.experts = nn.ModuleList([
+            SwiGLU(config)
+            for _ in range(self.num_leaves)
+        ])
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        # x: [batch, sequence, hidden]
+        original_shape = x.shape
+
+        flat_x = x.reshape(-1, self.hidden_size)
+
+        # Choose one leaf for each token.
+        route = self.router(flat_x)
+        indices = route.argmax(dim=-1)
+
+        output = torch.empty_like(flat_x)
+
+        # Only execute the selected SwiGLU for each token.
+        for i, expert in enumerate(self.experts):
+            mask = indices == i
+
+            if mask.any():
+                output[mask] = expert(flat_x[mask])
+
+        return output.reshape(original_shape)
+
 
 
 class Block(nn.Module):
