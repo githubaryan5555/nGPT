@@ -18,7 +18,7 @@
   "max_seq_len": 256,
   "tie_word_embeddings": true,
   "initializer_range": 0.02,
-  "use_multi_token_pred": true,
+  "use_multi_token_pred": false,
   "num_pred_tokens": 2,
   "batch_size": 128,
   "gradient_accumulation_steps": 16,
