@@ -15,15 +15,6 @@ except ImportError:  # Support running ``python test4/model.py`` directly.
     import config as cfg
 
 
-
-from liger_kernel.ops import LigerFusedGateUpSiLUMulFunction
-
-
-
-
-
-
-
 @dataclass
 class Config:
     vocab_size: int = cfg.vocab_size
@@ -188,35 +179,15 @@ class GQAAttention(nn.Module):
         return self.o_proj(y)
 
 
-from liger_kernel.ops import LigerFusedGateUpSiLUMulFunction
-
 class SwiGLU(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: Config):
         super().__init__()
-        # Combines gate and up projections into one layer to reduce T4 HBM kernel calls
-        self.gate_up_proj = nn.Linear(config.hidden_size, 2 * config.intermediate_size, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        # 1. Project input (Output Shape: [..., 2 * intermediate_size])
-        gate_up = self.gate_up_proj(x)
-        
-        # 2. Capture shape properties dynamically
-        orig_shape = gate_up.shape
-        
-        # 3. Flatten dimensions ahead of the feature dimension to satisfy Triton's 2D input expectation
-        fused_activated = LigerFusedGateUpSiLUMulFunction.apply(
-            gate_up.view(-1, orig_shape[-1]), 
-            True # in_place=True forces gradient recycling -> Crucial to prevent VRAM OOMs during pretraining
-        )
-        
-        # 4. Unpack original shape parameters dynamically, discarding the doubled projection size
-        activated = fused_activated.view(*orig_shape[:-1], -1)
-        
-        # 5. Output down projection
-        return self.down_proj(activated)
-
-
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Block(nn.Module):
