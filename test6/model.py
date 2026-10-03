@@ -190,7 +190,7 @@ class SwiGLU(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-                                                * 100.0
+        
         
 
 class Block(nn.Module):
