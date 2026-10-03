@@ -238,7 +238,7 @@ def language_loss(model_module, hidden, targets):
         mask = (flat_targets >= start) & (flat_targets < end)
         if mask.any():
             target_positions = flat_targets[mask] - start
-            target_logits[mask] = chunk_logits[mask, target_positions]
+            target_logits[mask] = chunk_logits[mask, target_positions].to(target_logits.dtype)
             seen_targets[mask] = True
 
     if not seen_targets.all():
