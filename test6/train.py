@@ -4,10 +4,6 @@ The binary files are already tokenized. Configuration is loaded by config.py fro
 config.json, while command-line ``--name=value`` arguments can override it.
 """
 
-from liger_kernel.transformers import apply_liger_kernel
-apply_liger_kernel() # Automatically fuses and optimizes the LM Head & Cross Entropy
-
-
 
 import argparse
 import glob
