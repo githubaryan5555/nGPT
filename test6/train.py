@@ -203,47 +203,8 @@ if ddp:
 raw_model = model.module if ddp else model
 
 
-def hidden_states(model_module, x):
-    """Run the transformer stack to the final hidden state without materializing logits."""
-    x = model_module.embed_dropout(model_module.embed_tokens(x))
-    for layer in model_module.layers:
-        x = layer(x, attention_mask=None)
-    return model_module.final_layernorm(x)
-
-
-def language_loss(model_module, hidden, targets):
-    """Exact cross-entropy computed in vocab chunks to avoid [B*T, V] logits allocation."""
-    flat_hidden = hidden.reshape(-1, hidden.size(-1))
-    flat_targets = targets.reshape(-1)
-    vocab_size = model_module.config.vocab_size
-    chunk_size = model_module.config.vocab_chunk_size
-
-    global_max = torch.full((flat_hidden.size(0),), -torch.inf, device=flat_hidden.device, dtype=flat_hidden.dtype)
-    denom = torch.zeros((flat_hidden.size(0),), device=flat_hidden.device, dtype=flat_hidden.dtype)
-    target_logits = torch.empty((flat_hidden.size(0),), device=flat_hidden.device, dtype=flat_hidden.dtype)
-    seen_targets = torch.zeros_like(flat_targets, dtype=torch.bool)
-
-    for start in range(0, vocab_size, chunk_size):
-        end = min(start + chunk_size, vocab_size)
-        chunk_logits = F.linear(flat_hidden, model_module.lm_head.weight[start:end])
-        chunk_max = chunk_logits.max(dim=-1).values
-        global_max = torch.maximum(global_max, chunk_max)
-
-    for start in range(0, vocab_size, chunk_size):
-        end = min(start + chunk_size, vocab_size)
-        chunk_logits = F.linear(flat_hidden, model_module.lm_head.weight[start:end])
-        shifted = chunk_logits - global_max.unsqueeze(-1)
-        denom += torch.exp(shifted).sum(dim=-1)
-
-        mask = (flat_targets >= start) & (flat_targets < end)
-        if mask.any():
-            target_positions = flat_targets[mask] - start
-            target_logits[mask] = chunk_logits[mask, target_positions].to(target_logits.dtype)
-            seen_targets[mask] = True
-
-    if not seen_targets.all():
-        raise RuntimeError("target token was not found in the vocab range")
-    return global_max + torch.log(denom) - target_logits
+def language_loss(logits, targets):
+    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
 
 @torch.no_grad()
@@ -255,8 +216,7 @@ def estimate_loss():
         for _ in range(cfg.eval_iters):
             x, y = batches.get(split)
             with ctx:
-                hidden = hidden_states(model, x)
-                value = language_loss(model, hidden, y).mean()
+                value = language_loss(model(x), y)
             totals[index] += value.detach().double()
     if ddp:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
@@ -365,11 +325,12 @@ while iter_num < cfg.max_iters:
         if ddp:
             model.require_backward_grad_sync = micro_step == local_grad_accum - 1
         with ctx:
-            hidden = hidden_states(model, X)
-            micro_loss = language_loss(model, hidden, Y).mean() / local_grad_accum
-        step_loss_sum += language_loss(model, hidden, Y).mean().detach().double()  # preserves per-step loss reporting
+            logits = model(X)
+            micro_loss = language_loss(logits, Y)
+            loss = micro_loss / local_grad_accum
+        step_loss_sum += micro_loss.detach().double()
         X, Y = batches.get("train")
-        scaler.scale(micro_loss).backward()
+        scaler.scale(loss).backward()
     if cfg.grad_clip:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
