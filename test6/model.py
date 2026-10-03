@@ -18,6 +18,7 @@ except ImportError:  # Support running ``python test6/model.py`` directly.
 @dataclass
 class Config:
     vocab_size: int = cfg.vocab_size
+    vocab_chunk_size: int = cfg.vocab_chunk_size
     hidden_size: int = cfg.hidden_size
     num_hidden_layers: int = cfg.num_hidden_layers
     intermediate_size: int = cfg.intermediate_size
