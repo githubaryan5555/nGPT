@@ -11,14 +11,13 @@ import torch.nn.functional as F
 
 try:
     from . import config as cfg
-except ImportError:  # Support running ``python test6/model.py`` directly.
+except ImportError:  # Support running ``python test4/model.py`` directly.
     import config as cfg
 
 
 @dataclass
 class Config:
     vocab_size: int = cfg.vocab_size
-    vocab_chunk_size: int = cfg.vocab_chunk_size
     hidden_size: int = cfg.hidden_size
     num_hidden_layers: int = cfg.num_hidden_layers
     intermediate_size: int = cfg.intermediate_size
@@ -282,8 +281,7 @@ class Model5555LM(nn.Module):
             x = layer(x, attention_mask)
             if output_hidden_states:
                 hidden_states.append(x)
-        x = self.final_layernorm(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(self.final_layernorm(x))
         if output_hidden_states:
             return logits, hidden_states
         return logits
