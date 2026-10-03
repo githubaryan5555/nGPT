@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 try:
     from . import config as cfg
-except ImportError:  # Support running ``python test4/model.py`` directly.
+except ImportError:  # Support running ``python test6/model.py`` directly.
     import config as cfg
 
 
@@ -30,12 +30,13 @@ class Config:
     max_seq_len: int = cfg.max_seq_len
     tie_word_embeddings: bool = cfg.tie_word_embeddings
     initializer_range: float = cfg.initializer_range
+    vocab_chunk_size: int = 8192
 
     def __post_init__(self):
         integer_fields = (
             "vocab_size", "hidden_size", "num_hidden_layers",
             "intermediate_size", "num_attention_heads",
-            "num_key_value_heads", "max_seq_len",
+            "num_key_value_heads", "max_seq_len", "vocab_chunk_size",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -56,6 +57,8 @@ class Config:
             raise ValueError("head_dim must be even for RoPE")
         if self.intermediate_size <= self.hidden_size:
             raise ValueError("intermediate_size must be greater than hidden_size")
+        if self.vocab_size % self.vocab_chunk_size != 0:
+            raise ValueError("vocab_size must be divisible by vocab_chunk_size")
 
         for name in ("rms_norm_eps", "rope_theta", "initializer_range"):
             value = getattr(self, name)
@@ -246,6 +249,19 @@ class Model5555LM(nn.Module):
         elif isinstance(module, RMSNorm):
             nn.init.ones_(module.weight)
 
+    def _compute_logits_chunked(self, x):
+        """Compute full logits by chunking the vocabulary dimension."""
+        b, t, d = x.shape
+        vocab_size = self.config.vocab_size
+        chunk_size = self.config.vocab_chunk_size
+        logits = torch.empty((b, t, vocab_size), device=x.device, dtype=x.dtype)
+        flat_x = x.reshape(b * t, d)
+        for start in range(0, vocab_size, chunk_size):
+            end = min(start + chunk_size, vocab_size)
+            logits_chunk = F.linear(flat_x, self.lm_head.weight[start:end])
+            logits[:, :, start:end] = logits_chunk.view(b, t, end - start)
+        return logits
+
     def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
         if not isinstance(input_ids, torch.Tensor):
             raise TypeError("input_ids must be a torch.Tensor")
@@ -281,7 +297,8 @@ class Model5555LM(nn.Module):
             x = layer(x, attention_mask)
             if output_hidden_states:
                 hidden_states.append(x)
-        logits = self.lm_head(self.final_layernorm(x))
+        x = self.final_layernorm(x)
+        logits = self._compute_logits_chunked(x)
         if output_hidden_states:
             return logits, hidden_states
         return logits
