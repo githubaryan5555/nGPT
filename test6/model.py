@@ -246,7 +246,7 @@ class Model5555LM(nn.Module):
         elif isinstance(module, RMSNorm):
             nn.init.ones_(module.weight)
 
-    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=False, return_logits=True):
         if not isinstance(input_ids, torch.Tensor):
             raise TypeError("input_ids must be a torch.Tensor")
         if input_ids.ndim != 2:
@@ -282,6 +282,10 @@ class Model5555LM(nn.Module):
             if output_hidden_states:
                 hidden_states.append(x)
         x = self.final_layernorm(x)
+        if not return_logits:
+            if output_hidden_states:
+                return x, hidden_states
+            return x
         logits = self.lm_head(x)
         if output_hidden_states:
             return logits, hidden_states
