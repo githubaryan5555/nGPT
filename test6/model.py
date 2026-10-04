@@ -225,16 +225,15 @@ class Model5555LM(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
-        self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
+        self.layer = Block(config)  # Single reusable block
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._init_weights)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
         residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
-        for layer in self.layers:
-            nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
-            nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
+        nn.init.normal_(self.layer.self_attn.o_proj.weight, std=residual_std)
+        nn.init.normal_(self.layer.mlp.down_proj.weight, std=residual_std)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -277,8 +276,8 @@ class Model5555LM(nn.Module):
             raise ValueError(f"input_ids contains a token outside [0, {self.config.vocab_size})")
         x = self.embed_dropout(self.embed_tokens(input_ids))
         hidden_states = [] if output_hidden_states else None
-        for layer in self.layers:
-            x = layer(x, attention_mask)
+        for _ in range(self.config.num_hidden_layers):
+            x = self.layer(x, attention_mask)
             if output_hidden_states:
                 hidden_states.append(x)
         logits = self.lm_head(self.final_layernorm(x))
