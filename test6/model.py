@@ -140,6 +140,8 @@ class GQAAttention(nn.Module):
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.rope = RoPE(config.head_dim, config.max_seq_len, config.rope_theta)
 
+
+    
     def repeat_kv(self, x):
         if self.num_queries_per_kv == 1:
             return x
@@ -147,6 +149,15 @@ class GQAAttention(nn.Module):
         return x[:, :, :, None, :].expand(
             b, t, kv_heads, self.num_queries_per_kv, d
         ).reshape(b, t, self.num_attention_heads, d)
+
+    
+    def repeat_kv(self, x):
+        if self.num_queries_per_kv == 1:
+            return x
+        b, t, kv_heads, d = x.shape
+        # Use repeat instead of expand to avoid memory bloat
+        return x.repeat_interleave(self.num_queries_per_kv, dim=2)
+    
 
     def forward(self, x, attention_mask=None):
         b, t, _ = x.shape
