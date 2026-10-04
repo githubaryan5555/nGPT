@@ -97,22 +97,32 @@ class RoPE(nn.Module):
         angles = torch.outer(
             torch.arange(max_seq_len, dtype=torch.float32), inv_freq
         )
-        self.register_buffer("cos", angles.cos(), persistent=False)
-        self.register_buffer("sin", angles.sin(), persistent=False)
+        # Cache in float32, convert on-the-fly only when needed
+        self.register_buffer("cos_cached", angles.cos().to(torch.float32), persistent=False)
+        self.register_buffer("sin_cached", angles.sin().to(torch.float32), persistent=False)
+        self._cached_device = None
+        self._cached_dtype = None
 
     def forward(self, x, position_offset=0):
         seq_len = x.size(1)
         end = position_offset + seq_len
-        if position_offset < 0 or end > self.cos.size(0):
+        if position_offset < 0 or end > self.cos_cached.size(0):
             raise ValueError(
                 f"position range [{position_offset}, {end}) exceeds RoPE limit "
-                f"{self.cos.size(0)}"
+                f"{self.cos_cached.size(0)}"
             )
-        cos = self.cos[position_offset:end].to(device=x.device, dtype=x.dtype)
-        sin = self.sin[position_offset:end].to(device=x.device, dtype=x.dtype)
+        # Only convert if device/dtype differs
+        if x.device != self.cos_cached.device or x.dtype != self.cos_cached.dtype:
+            cos = self.cos_cached[position_offset:end].to(device=x.device, dtype=x.dtype)
+            sin = self.sin_cached[position_offset:end].to(device=x.device, dtype=x.dtype)
+        else:
+            cos = self.cos_cached[position_offset:end]
+            sin = self.sin_cached[position_offset:end]
+        
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         even, odd = x[..., 0::2], x[..., 1::2]
         return torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1).flatten(-2)
+    
 
 
 class GQAAttention(nn.Module):
