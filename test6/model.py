@@ -232,8 +232,8 @@ class Model5555LM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
         residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
-            nn.init.normal_(self.block.self_attn.o_proj.weight, std=residual_std)
-            nn.init.normal_(self.block.mlp.down_proj.weight, std=residual_std)
+        nn.init.normal_(self.block.self_attn.o_proj.weight, std=residual_std)
+        nn.init.normal_(self.block.mlp.down_proj.weight, std=residual_std)
 
     
     def _init_weights(self, module):
