@@ -191,12 +191,6 @@ class SwiGLU(nn.Module):
 
 
 class Block(nn.Module):
-    """Transformer block with normalization and residual connections.
-    
-    Uses pre-normalization (normalization before sublayers) and residual
-    skip connections for improved training stability.
-    """
-    
     def __init__(self, config: Config):
         super().__init__()
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -205,41 +199,21 @@ class Block(nn.Module):
         self.mlp = SwiGLU(config)
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
 
-    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Forward pass with residual connections.
-        
-        Args:
-            x: Hidden states [B, T, D]
-            attention_mask: Attention mask [B, T] (optional)
-            
-        Returns:
-            Updated hidden states [B, T, D]
-        """
-        # Attention block with residual
-        attn_out = self.self_attn(self.input_layernorm(x), attention_mask)
-        x = x + self.hidden_dropout(attn_out)
-        
-        # MLP block with residual
-        mlp_out = self.mlp(self.post_attention_layernorm(x))
-        x = x + self.hidden_dropout(mlp_out)
-        
+    def forward(self, x, attention_mask=None):
+        x = x + self.hidden_dropout(
+            self.self_attn(self.input_layernorm(x), attention_mask)
+        )
+        x = x + self.hidden_dropout(
+            self.mlp(self.post_attention_layernorm(x))
+        )
         return x
 
 
 class Model5555LM(nn.Module):
-    """Causal language model with weight-sharing architecture.
-    
-    This model uses a single transformer block that is reused multiple times,
-    reducing parameter count while maintaining computational depth. This is
-    inspired by Universal Transformers and Recurrent Neural Networks.
-    
-    Input/Output shapes: [B, T] -> [B, T, V]
-    """
+    """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``."""
 
     def __init__(self, config: Optional[Config] = None, **overrides):
         super().__init__()
-        
-        # Config initialization
         if config is None:
             config = Config()
         if not isinstance(config, Config):
@@ -248,35 +222,21 @@ class Model5555LM(nn.Module):
             values = asdict(config)
             values.update(overrides)
             config = Config(**values)
-        
         self.config = config
-        
-        # Input embeddings
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
-        
-        # Single shared block reused num_hidden_layers times
-        self.block = Block(config)
-        self.num_repeats = config.num_hidden_layers
-        
-        # Output layers
+        self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
-        # Initialize weights
         self.apply(self._init_weights)
-        
-        # Weight tying: share embeddings and output layer
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
-        
-        # Residual connection scaling based on computational depth
         residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
-        nn.init.normal_(self.block.self_attn.o_proj.weight, std=residual_std)
-        nn.init.normal_(self.block.mlp.down_proj.weight, std=residual_std)
+        for layer in self.layers:
+            nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
+            nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
 
-    def _init_weights(self, module: nn.Module) -> None:
-        """Initialize module weights."""
+    def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, std=self.config.initializer_range)
             if module.bias is not None:
@@ -286,214 +246,90 @@ class Model5555LM(nn.Module):
         elif isinstance(module, RMSNorm):
             nn.init.ones_(module.weight)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        output_hidden_states: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, list]:
-        """Forward pass through the model.
-        
-        Args:
-            input_ids: Token IDs [B, T]
-            attention_mask: Attention mask [B, T] (optional)
-            output_hidden_states: Whether to return hidden states
-            
-        Returns:
-            logits [B, T, V] or (logits, hidden_states) if output_hidden_states=True
-            
-        Raises:
-            TypeError: If input_ids is not a torch.Tensor
-            ValueError: If input_ids shape or values are invalid
-        """
-        # Input validation
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
         if not isinstance(input_ids, torch.Tensor):
             raise TypeError("input_ids must be a torch.Tensor")
         if input_ids.ndim != 2:
-            raise ValueError(
-                f"input_ids must have shape [B, T], got {tuple(input_ids.shape)}"
-            )
+            raise ValueError(f"input_ids must have shape [B, T], got {tuple(input_ids.shape)}")
         if input_ids.dtype != torch.long:
             raise TypeError(f"input_ids must be torch.long, got {input_ids.dtype}")
-        
         b, t = input_ids.shape
-        
         if b <= 0 or t <= 0:
             raise ValueError("batch size and sequence length must be > 0")
         if t > self.config.max_seq_len:
-            raise ValueError(
-                f"sequence length {t} exceeds max_seq_len {self.config.max_seq_len}"
-            )
-        
-        # Attention mask validation
+            raise ValueError(f"sequence length {t} exceeds max_seq_len {self.config.max_seq_len}")
         if attention_mask is not None:
             if not isinstance(attention_mask, torch.Tensor):
                 raise TypeError("attention_mask must be a torch.Tensor")
             if attention_mask.shape != input_ids.shape:
-                raise ValueError(
-                    "attention_mask must have the same shape as input_ids"
-                )
+                raise ValueError("attention_mask must have the same shape as input_ids")
             if attention_mask.device != input_ids.device:
-                raise ValueError(
-                    "attention_mask and input_ids must be on the same device"
-                )
-            
+                raise ValueError("attention_mask and input_ids must be on the same device")
             if attention_mask.dtype == torch.bool:
                 attention_mask = attention_mask.to(torch.bool)
-            elif (
-                attention_mask.is_floating_point()
-                or attention_mask.dtype in (
-                    torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
-                )
+            elif attention_mask.is_floating_point() or attention_mask.dtype in (
+                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
             ):
                 attention_mask = attention_mask != 0
             else:
                 raise TypeError("attention_mask must be boolean or numeric")
-        
-        # Token ID validation
         if input_ids.min() < 0 or input_ids.max() >= self.config.vocab_size:
-            raise ValueError(
-                f"input_ids contains a token outside [0, {self.config.vocab_size})"
-            )
-        
-        # Embedding
+            raise ValueError(f"input_ids contains a token outside [0, {self.config.vocab_size})")
         x = self.embed_dropout(self.embed_tokens(input_ids))
         hidden_states = [] if output_hidden_states else None
-        
-        # Apply shared block num_hidden_layers times
-        for _ in range(self.num_repeats):
-            x = self.block(x, attention_mask)
+        for layer in self.layers:
+            x = layer(x, attention_mask)
             if output_hidden_states:
                 hidden_states.append(x)
-        
-        # Output normalization and projection
         logits = self.lm_head(self.final_layernorm(x))
-        
         if output_hidden_states:
             return logits, hidden_states
         return logits
 
-    def get_num_params(self) -> int:
-        """Get total number of parameters."""
+    def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
 
-    def get_trainable_params(self) -> int:
-        """Get number of trainable parameters."""
+    def get_trainable_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def get_model_size_mb(self, dtype_bytes: float = 2) -> float:
-        """Get model size in MB.
-        
-        Args:
-            dtype_bytes: Bytes per parameter (default 2 for float16)
-            
-        Returns:
-            Model size in MB
-        """
-        if (
-            not isinstance(dtype_bytes, Real)
-            or not math.isfinite(dtype_bytes)
-            or dtype_bytes <= 0
-        ):
+    def get_model_size_mb(self, dtype_bytes=2):
+        if not isinstance(dtype_bytes, Real) or not math.isfinite(dtype_bytes) or dtype_bytes <= 0:
             raise ValueError("dtype_bytes must be finite and > 0")
         return self.get_num_params() * dtype_bytes / 1024**2
 
-    def get_model_size_gb(self, dtype_bytes: float = 2) -> float:
-        """Get model size in GB."""
+    def get_model_size_gb(self, dtype_bytes=2):
         return self.get_model_size_mb(dtype_bytes) / 1024
 
-    def get_flops_per_token(self, seq_len: Optional[int] = None) -> int:
-        """Get FLOPs per token for this model.
-        
-        Accounts for the computational depth even though parameters are shared.
-        
-        Args:
-            seq_len: Sequence length (default max_seq_len)
-            
-        Returns:
-            FLOPs per token
-        """
+    def get_flops_per_token(self, seq_len=None):
         if seq_len is None:
             seq_len = self.config.max_seq_len
         if isinstance(seq_len, bool) or not isinstance(seq_len, int):
             raise TypeError("seq_len must be an int")
         if not 0 < seq_len <= self.config.max_seq_len:
             raise ValueError("seq_len is outside the model context")
-        
-        d = self.config.hidden_size
-        f = self.config.intermediate_size
-        h = self.config.num_attention_heads
-        kv = self.config.num_key_value_heads
-        v = self.config.vocab_size
-        layers = self.config.num_hidden_layers
-        
+        d, f = self.config.hidden_size, self.config.intermediate_size
+        h, kv, v, layers = self.config.num_attention_heads, self.config.num_key_value_heads, self.config.vocab_size, self.config.num_hidden_layers
         head_dim = d // h
-        
-        # Attention projections: Q, K, V, O
-        projection = 2 * (d * d + 2 * d * kv * head_dim)
-        
-        # MLP: gate, up, down
+        projection = 2 * (d*d + 2*d*kv*head_dim)
         mlp = 6 * d * f
-        
-        # Total FLOPs: layers × (attention + mlp + attention computation) + embedding projection
         return layers * (projection + mlp + 4 * seq_len * d) + 2 * d * v
 
-    def estimate_mfu(self, tokens_per_second: float, peak_flops: float) -> float:
-        """Estimate model FLOPs utilization (MFU).
-        
-        Args:
-            tokens_per_second: Tokens processed per second
-            peak_flops: Peak FLOPs of the hardware
-            
-        Returns:
-            MFU percentage
-        """
-        for name, value in (
-            ("tokens_per_second", tokens_per_second),
-            ("peak_flops", peak_flops),
-        ):
+    def estimate_mfu(self, tokens_per_second, peak_flops):
+        for name, value in (("tokens_per_second", tokens_per_second), ("peak_flops", peak_flops)):
             if not isinstance(value, Real) or not math.isfinite(value):
                 raise TypeError(f"{name} must be a finite number")
-        
         if tokens_per_second < 0:
             raise ValueError("tokens_per_second must be >= 0")
         if peak_flops <= 0:
             raise ValueError("peak_flops must be > 0")
-        
         return tokens_per_second * self.get_flops_per_token() / peak_flops * 100.0
 
-    def get_config(self) -> dict:
-        """Get model configuration as dictionary."""
+    def get_config(self):
         return asdict(self.config)
 
     @torch.no_grad()
-    def generate(
-        self,
-        text: str,
-        tokenizer,
-        max_new_tokens: int = 100,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        top_p: Optional[float] = None,
-        eos_token_id: Optional[int] = None,
-        do_sample: bool = True,
-    ) -> str:
-        """Generate text from a prompt.
-        
-        Args:
-            text: Input prompt string
-            tokenizer: Tokenizer with encode/decode methods
-            max_new_tokens: Maximum tokens to generate
-            temperature: Sampling temperature (>0)
-            top_k: Top-k sampling parameter
-            top_p: Nucleus (top-p) sampling parameter
-            eos_token_id: End-of-sequence token ID
-            do_sample: If False, use greedy decoding
-            
-        Returns:
-            Generated text string
-        """
-        # Input validation
+    def generate(self, text, tokenizer, max_new_tokens=100, temperature=1.0,
+                 top_k=None, top_p=None, eos_token_id=None, do_sample=True):
         if not isinstance(text, str):
             raise TypeError("text must be a string")
         if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
@@ -502,93 +338,59 @@ class Model5555LM(nn.Module):
             raise ValueError("max_new_tokens must be >= 0")
         if not isinstance(do_sample, bool):
             raise TypeError("do_sample must be a bool")
-        if (
-            not isinstance(temperature, Real)
-            or not math.isfinite(temperature)
-            or temperature <= 0
-        ):
+        if not isinstance(temperature, Real) or not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be finite and > 0")
-        
-        if top_k is not None and (
-            isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0
-        ):
+        if top_k is not None and (isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0):
             raise ValueError("top_k must be a positive integer")
-        if top_p is not None and (
-            not isinstance(top_p, Real)
-            or not math.isfinite(top_p)
-            or not 0 < top_p <= 1
-        ):
+        if top_p is not None and (not isinstance(top_p, Real) or not math.isfinite(top_p) or not 0 < top_p <= 1):
             raise ValueError("top_p must be finite and in (0, 1]")
-        
         if eos_token_id is not None:
             if isinstance(eos_token_id, bool) or not isinstance(eos_token_id, int):
                 raise TypeError("eos_token_id must be an int")
             if not 0 <= eos_token_id < self.config.vocab_size:
                 raise ValueError("eos_token_id is outside vocabulary")
-        
-        # Encode prompt
+
         encoded = tokenizer.encode(text)
-        if isinstance(encoded, torch.Tensor):
-            ids = encoded.to(dtype=torch.long)
-        else:
-            ids = torch.tensor(encoded, dtype=torch.long)
-        
+        ids = encoded.to(dtype=torch.long) if isinstance(encoded, torch.Tensor) else torch.tensor(encoded, dtype=torch.long)
         if ids.ndim == 1:
             ids = ids.unsqueeze(0)
-        
         if ids.ndim != 2 or ids.size(0) != 1:
             raise ValueError("tokenizer.encode must return one sequence")
         if ids.size(1) == 0:
             raise ValueError("prompt must contain at least one token")
         if ids.min() < 0 or ids.max() >= self.config.vocab_size:
             raise ValueError("tokenizer produced a token outside the model vocabulary")
-        
+
         output_ids = ids.to(device=self.embed_tokens.weight.device, dtype=torch.long)
         was_training = self.training
         self.eval()
-        
         try:
             for _ in range(max_new_tokens):
                 context = output_ids[:, -self.config.max_seq_len:]
                 logits = self(context)[:, -1, :]
-                
                 if not do_sample:
                     next_token = logits.argmax(dim=-1, keepdim=True)
                 else:
                     logits = logits / temperature
-                    
-                    # Top-k sampling
                     if top_k is not None:
                         k = min(top_k, logits.size(-1))
                         threshold = torch.topk(logits, k, dim=-1).values[:, [-1]]
                         logits = logits.masked_fill(logits < threshold, float("-inf"))
-                    
-                    # Nucleus (top-p) sampling
                     if top_p is not None and top_p < 1.0:
-                        sorted_logits, sorted_indices = torch.sort(
-                            logits, descending=True, dim=-1
-                        )
+                        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
                         cumulative = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
                         remove = cumulative > top_p
                         remove[..., 1:] = remove[..., :-1].clone()
                         remove[..., 0] = False
                         sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
-                        
                         logits = torch.full_like(logits, float("-inf"))
                         logits.scatter_(-1, sorted_indices, sorted_logits)
-                    
                     if not torch.isfinite(logits).any(dim=-1).all():
-                        raise RuntimeError(
-                            "model produced no finite logits for sampling"
-                        )
-                    
+                        raise RuntimeError("model produced no finite logits for sampling")
                     next_token = torch.multinomial(F.softmax(logits, dim=-1), 1)
-                
                 output_ids = torch.cat((output_ids, next_token), dim=1)
-                
                 if eos_token_id is not None and bool((next_token == eos_token_id).all()):
                     break
         finally:
             self.train(was_training)
-        
         return tokenizer.decode(output_ids[0].tolist())
