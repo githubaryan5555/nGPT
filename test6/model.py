@@ -349,16 +349,10 @@ class Model5555LM(nn.Module):
         
 
         for loop_idx in range(self.config.num_hidden_layers):
-            loop_vec = self.loop_identity(
-                loop_idx,
-                device=x.device,
-                dtype=x.dtype,
-            )
-
-            # Add the same H-dimensional loop identity to every token.
+            loop_vec = self.loop_identity(loop_idx, device=x.device, dtype=x.dtype)
+            x = self.block(x, attention_mask)
             x = x + 0.01 * loop_vec
 
-            x = self.block(x, attention_mask)
 
             if output_hidden_states:
                 hidden_states.append(x)
