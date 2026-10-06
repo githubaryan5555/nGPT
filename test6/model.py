@@ -124,6 +124,58 @@ class RoPE(nn.Module):
         return torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1).flatten(-2)
 
 
+class LoopIdentity(nn.Module):
+    """
+    Non-learned sinusoidal identity for each shared-block loop.
+
+    Returns one [1, 1, hidden_size] vector for the current loop.
+    The vector is broadcast across the entire sequence.
+    """
+
+    def __init__(self, dim: int, theta: float = 10000.0):
+        super().__init__()
+
+        if dim <= 0:
+            raise ValueError("dim must be > 0")
+        if dim % 2 != 0:
+            raise ValueError("hidden_size must be even")
+        if theta <= 0:
+            raise ValueError("theta must be > 0")
+
+        self.dim = dim
+
+        inv_freq = 1.0 / theta ** (
+            torch.arange(0, dim, 2, dtype=torch.float32) / dim
+        )
+
+        self.register_buffer(
+            "inv_freq",
+            inv_freq,
+            persistent=False,
+        )
+
+    def forward(self, loop_index, device, dtype):
+        if isinstance(loop_index, bool) or not isinstance(loop_index, int):
+            raise TypeError("loop_index must be an int")
+        if loop_index < 0:
+            raise ValueError("loop_index must be >= 0")
+
+        position = torch.tensor(
+            float(loop_index),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        angles = position * self.inv_freq.to(device=device)
+
+        sin = angles.sin()
+        cos = angles.cos()
+
+        identity = torch.stack((sin, cos), dim=-1).flatten()
+
+        return identity.to(dtype=dtype).view(1, 1, self.dim)
+
+
 class GQAAttention(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -232,9 +284,17 @@ class Model5555LM(nn.Module):
             values.update(overrides)
             config = Config(**values)
         self.config = config
+
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
+
+        self.loop_identity = LoopIdentity(
+            config.hidden_size,
+            theta=config.rope_theta,
+        )
+
         self.block = Block(config)  # Single block, shared weights
+        
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._init_weights)
@@ -286,10 +346,24 @@ class Model5555LM(nn.Module):
             raise ValueError(f"input_ids contains a token outside [0, {self.config.vocab_size})")
         x = self.embed_dropout(self.embed_tokens(input_ids))
         hidden_states = [] if output_hidden_states else None
-        for _ in range(self.config.num_hidden_layers):
+        
+
+        for loop_idx in range(self.config.num_hidden_layers):
+            loop_vec = self.loop_identity(
+                loop_idx,
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+            # Add the same H-dimensional loop identity to every token.
+            x = x + loop_vec
+
             x = self.block(x, attention_mask)
+
             if output_hidden_states:
                 hidden_states.append(x)
+
+        
         logits = self.lm_head(self.final_layernorm(x))
         if output_hidden_states:
             return logits, hidden_states
