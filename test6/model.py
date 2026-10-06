@@ -356,7 +356,7 @@ class Model5555LM(nn.Module):
             )
 
             # Add the same H-dimensional loop identity to every token.
-            x = x + loop_vec
+            x = x + 0.01 * loop_vec
 
             x = self.block(x, attention_mask)
 
