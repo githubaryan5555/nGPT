@@ -6,7 +6,6 @@
   "dataset_dtype": "uint16",
   "tokenizer_path": "tokenizer/tokenizer.json",
   "vocab_size": 8192,
-  "vocab_chunk_size": 2048,
   "hidden_size": 512,
   "num_hidden_layers": 8,
   "intermediate_size": 1024,
