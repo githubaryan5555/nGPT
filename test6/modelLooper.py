@@ -19,7 +19,8 @@ except ImportError:  # Support running ``python test4/model.py`` directly.
 class Config:
     vocab_size: int = cfg.vocab_size
     hidden_size: int = cfg.hidden_size
-    num_hidden_layers: int = cfg.num_hidden_layers
+    num_unique_hidden_layers: int = cfg.num_unique_hidden_layers
+    num_loops: int = cfg.num_loops
     intermediate_size: int = cfg.intermediate_size
     num_attention_heads: int = cfg.num_attention_heads
     num_key_value_heads: int = cfg.num_key_value_heads
@@ -33,7 +34,7 @@ class Config:
 
     def __post_init__(self):
         integer_fields = (
-            "vocab_size", "hidden_size", "num_hidden_layers",
+            "vocab_size", "hidden_size", "num_unique_hidden_layers", "num_loops",
             "intermediate_size", "num_attention_heads",
             "num_key_value_heads", "max_seq_len",
         )
@@ -85,7 +86,9 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         variance = x.float().pow(2).mean(dim=-1, keepdim=True)
-        return x * torch.rsqrt(variance + self.eps).to(x.dtype) * self.weight
+        norm = torch.rsqrt(variance + self.eps)
+        weight = self.weight.to(x.dtype)
+        return x * norm.to(x.dtype) * weight
 
 
 class RoPE(nn.Module):
@@ -122,58 +125,6 @@ class RoPE(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         even, odd = x[..., 0::2], x[..., 1::2]
         return torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1).flatten(-2)
-
-
-class LoopIdentity(nn.Module):
-    """
-    Non-learned sinusoidal identity for each shared-block loop.
-
-    Returns one [1, 1, hidden_size] vector for the current loop.
-    The vector is broadcast across the entire sequence.
-    """
-
-    def __init__(self, dim: int, theta: float = 10000.0):
-        super().__init__()
-
-        if dim <= 0:
-            raise ValueError("dim must be > 0")
-        if dim % 2 != 0:
-            raise ValueError("hidden_size must be even")
-        if theta <= 0:
-            raise ValueError("theta must be > 0")
-
-        self.dim = dim
-
-        inv_freq = 1.0 / theta ** (
-            torch.arange(0, dim, 2, dtype=torch.float32) / dim
-        )
-
-        self.register_buffer(
-            "inv_freq",
-            inv_freq,
-            persistent=False,
-        )
-
-    def forward(self, loop_index, device, dtype):
-        if isinstance(loop_index, bool) or not isinstance(loop_index, int):
-            raise TypeError("loop_index must be an int")
-        if loop_index < 0:
-            raise ValueError("loop_index must be >= 0")
-
-        position = torch.tensor(
-            float(loop_index),
-            device=device,
-            dtype=torch.float32,
-        )
-
-        angles = position * self.inv_freq.to(device=device)
-
-        sin = angles.sin()
-        cos = angles.cos()
-
-        identity = torch.stack((sin, cos), dim=-1).flatten()
-
-        return identity.to(dtype=dtype).view(1, 1, self.dim)
 
 
 class GQAAttention(nn.Module):
@@ -271,7 +222,12 @@ class Block(nn.Module):
 
 
 class Model5555LM(nn.Module):
-    """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``."""
+    """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``.
+    
+    Uses num_unique_hidden_layers unique blocks, each looped num_loops times.
+    Total depth = num_unique_hidden_layers * num_loops.
+    Pattern: block[0] -> block[1] -> ... -> block[num_unique_hidden_layers-1] -> block[0] -> ...
+    """
 
     def __init__(self, config: Optional[Config] = None, **overrides):
         super().__init__()
@@ -288,21 +244,20 @@ class Model5555LM(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.hidden_dropout)
 
-        self.loop_identity = LoopIdentity(
-            config.hidden_size,
-            theta=config.rope_theta,
-        )
-
-        self.block = Block(config)  # Single block, shared weights
+        # Create num_unique_hidden_layers unique blocks
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.num_unique_hidden_layers)])
         
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._init_weights)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
-        residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
-        nn.init.normal_(self.block.self_attn.o_proj.weight, std=residual_std)
-        nn.init.normal_(self.block.mlp.down_proj.weight, std=residual_std)
+        
+        # Initialize residual projections for all blocks
+        residual_std = config.initializer_range / math.sqrt(2 * config.num_unique_hidden_layers * config.num_loops)
+        for block in self.blocks:
+            nn.init.normal_(block.self_attn.o_proj.weight, std=residual_std)
+            nn.init.normal_(block.mlp.down_proj.weight, std=residual_std)
 
     
     def _init_weights(self, module):
@@ -347,17 +302,15 @@ class Model5555LM(nn.Module):
         x = self.embed_dropout(self.embed_tokens(input_ids))
         hidden_states = [] if output_hidden_states else None
         
-
-        for loop_idx in range(self.config.num_hidden_layers):
-            loop_vec = self.loop_identity(loop_idx, device=x.device, dtype=x.dtype)
-            x = self.block(x, attention_mask)
-            x = x + 0.01 * loop_vec
-
+        # Loop pattern: cycle through blocks num_loops times
+        total_steps = self.config.num_unique_hidden_layers * self.config.num_loops
+        for step in range(total_steps):
+            block_idx = step % self.config.num_unique_hidden_layers
+            x = self.blocks[block_idx](x, attention_mask)
 
             if output_hidden_states:
                 hidden_states.append(x)
 
-        
         logits = self.lm_head(self.final_layernorm(x))
         if output_hidden_states:
             return logits, hidden_states
@@ -385,7 +338,8 @@ class Model5555LM(nn.Module):
         if not 0 < seq_len <= self.config.max_seq_len:
             raise ValueError("seq_len is outside the model context")
         d, f = self.config.hidden_size, self.config.intermediate_size
-        h, kv, v, layers = self.config.num_attention_heads, self.config.num_key_value_heads, self.config.vocab_size, self.config.num_hidden_layers
+        h, kv, v = self.config.num_attention_heads, self.config.num_key_value_heads, self.config.vocab_size
+        layers = self.config.num_unique_hidden_layers * self.config.num_loops
         head_dim = d // h
         projection = 2 * (d*d + 2*d*kv*head_dim)
         mlp = 6 * d * f
