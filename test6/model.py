@@ -223,11 +223,11 @@ class Block(nn.Module):
         self.self_attn(self.input_layernorm(x), attention_mask)
     ) * self.attn_residual_scale
 
-    x = x + self.hidden_dropout(
+        x = x + self.hidden_dropout(
         self.mlp(self.post_attention_layernorm(x))
     ) * self.mlp_residual_scale
 
-    return x
+        return x
 
 
 class Model5555LM(nn.Module):
