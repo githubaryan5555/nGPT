@@ -211,14 +211,23 @@ class Block(nn.Module):
         self.mlp = SwiGLU(config)
         self.hidden_dropout = nn.Dropout(config.hidden_dropout)
 
+        self.attn_residual_scale = nn.Parameter(
+            torch.full((config.hidden_size,), 0.1)
+        )
+        self.mlp_residual_scale = nn.Parameter(
+            torch.full((config.hidden_size,), 0.1)
+        )
+
     def forward(self, x, attention_mask=None):
         x = x + self.hidden_dropout(
-            self.self_attn(self.input_layernorm(x), attention_mask)
-        )
-        x = x + self.hidden_dropout(
-            self.mlp(self.post_attention_layernorm(x))
-        )
-        return x
+        self.self_attn(self.input_layernorm(x), attention_mask)
+    ) * self.attn_residual_scale
+
+    x = x + self.hidden_dropout(
+        self.mlp(self.post_attention_layernorm(x))
+    ) * self.mlp_residual_scale
+
+    return x
 
 
 class Model5555LM(nn.Module):
