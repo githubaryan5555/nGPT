@@ -21,6 +21,8 @@ class Config:
     hidden_size: int = cfg.hidden_size
     num_hidden_layers: int = cfg.num_hidden_layers
     intermediate_size: int = cfg.intermediate_size
+    num_token_pred: int = cfg.num_token_pred
+    output_head_dim: int = cfg.output_head_dim
     num_attention_heads: int = cfg.num_attention_heads
     num_key_value_heads: int = cfg.num_key_value_heads
     attention_dropout: float = cfg.attention_dropout
