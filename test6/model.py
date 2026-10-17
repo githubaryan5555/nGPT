@@ -230,6 +230,16 @@ class Model5555LM(nn.Module):
         self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        self.token_pred_heads = nn.ModuleList([
+            nn.Linear(config.hidden_size, config.output_head_dim, bias=False)
+            for _ in range(config.num_token_pred)
+        ])
+        self.head_to_hidden = nn.ModuleList([
+            nn.Linear(config.output_head_dim, config.hidden_size, bias=False)
+            for _ in range(config.num_token_pred)
+        ])
+        
         self.apply(self._init_weights)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -283,7 +293,14 @@ class Model5555LM(nn.Module):
             x = layer(x, attention_mask)
             if output_hidden_states:
                 hidden_states.append(x)
-        logits = self.lm_head(self.final_layernorm(x))
+
+        h = self.final_layernorm(x)
+        logits = []
+
+        for head, project_back in zip(self.token_pred_heads, self.head_to_hidden):
+            h_k = h + project_back(head(h))
+            logits.append(self.lm_head(h_k))
+
         if output_hidden_states:
             return logits, hidden_states
         return logits
