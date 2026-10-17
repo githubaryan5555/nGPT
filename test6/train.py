@@ -131,7 +131,7 @@ batches = TokenBatches()
 
 def model_values():
     return {name: getattr(cfg, name) for name in (
-        "vocab_size", "hidden_size", "num_hidden_layers", "intermediate_size",
+        "vocab_size", "hidden_size", "num_hidden_layers", "intermediate_size", "num_token_pred", "output_head_dim",
         "num_attention_heads", "num_key_value_heads", "attention_dropout",
         "hidden_dropout", "rms_norm_eps", "rope_theta", "tie_word_embeddings",
         "initializer_range") } | {"max_seq_len": max_seq_len}
@@ -203,9 +203,27 @@ if ddp:
 raw_model = model.module if ddp else model
 
 
-def language_loss(logits, targets):
-    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+def language_loss(logits_list, targets):
+    n = len(logits_list)
+    losses = []
 
+    for k, logits in enumerate(logits_list, start=1):
+        if k == 1:
+            shifted_targets = targets
+        else:
+            shifted_targets = torch.roll(targets, shifts=-(k - 1), dims=1)
+
+        valid_len = targets.size(1) - (k - 1)
+        if valid_len <= 0:
+            continue
+
+        loss = F.cross_entropy(
+            logits[:, :valid_len, :].reshape(-1, logits.size(-1)),
+            shifted_targets[:, :valid_len].reshape(-1),
+        )
+        losses.append(loss)
+
+    return torch.stack(losses).mean()
 
 @torch.no_grad()
 def estimate_loss():
