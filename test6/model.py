@@ -386,7 +386,7 @@ class Model5555LM(nn.Module):
         try:
             for _ in range(max_new_tokens):
                 context = output_ids[:, -self.config.max_seq_len:]
-                logits = self(context)[:, -1, :]
+                logits = self(context)[0][:, -1, :]
                 if not do_sample:
                     next_token = logits.argmax(dim=-1, keepdim=True)
                 else:
