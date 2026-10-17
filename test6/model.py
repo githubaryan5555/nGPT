@@ -97,32 +97,22 @@ class RoPE(nn.Module):
         angles = torch.outer(
             torch.arange(max_seq_len, dtype=torch.float32), inv_freq
         )
-        # Cache in float32, convert on-the-fly only when needed
-        self.register_buffer("cos_cached", angles.cos().to(torch.float32), persistent=False)
-        self.register_buffer("sin_cached", angles.sin().to(torch.float32), persistent=False)
-        self._cached_device = None
-        self._cached_dtype = None
+        self.register_buffer("cos", angles.cos(), persistent=False)
+        self.register_buffer("sin", angles.sin(), persistent=False)
 
     def forward(self, x, position_offset=0):
         seq_len = x.size(1)
         end = position_offset + seq_len
-        if position_offset < 0 or end > self.cos_cached.size(0):
+        if position_offset < 0 or end > self.cos.size(0):
             raise ValueError(
                 f"position range [{position_offset}, {end}) exceeds RoPE limit "
-                f"{self.cos_cached.size(0)}"
+                f"{self.cos.size(0)}"
             )
-        # Only convert if device/dtype differs
-        if x.device != self.cos_cached.device or x.dtype != self.cos_cached.dtype:
-            cos = self.cos_cached[position_offset:end].to(device=x.device, dtype=x.dtype)
-            sin = self.sin_cached[position_offset:end].to(device=x.device, dtype=x.dtype)
-        else:
-            cos = self.cos_cached[position_offset:end]
-            sin = self.sin_cached[position_offset:end]
-        
+        cos = self.cos[position_offset:end].to(device=x.device, dtype=x.dtype)
+        sin = self.sin[position_offset:end].to(device=x.device, dtype=x.dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         even, odd = x[..., 0::2], x[..., 1::2]
         return torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1).flatten(-2)
-    
 
 
 class GQAAttention(nn.Module):
@@ -140,8 +130,6 @@ class GQAAttention(nn.Module):
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.rope = RoPE(config.head_dim, config.max_seq_len, config.rope_theta)
 
-
-    
     def repeat_kv(self, x):
         if self.num_queries_per_kv == 1:
             return x
@@ -149,15 +137,6 @@ class GQAAttention(nn.Module):
         return x[:, :, :, None, :].expand(
             b, t, kv_heads, self.num_queries_per_kv, d
         ).reshape(b, t, self.num_attention_heads, d)
-
-    
-    def repeat_kv(self, x):
-        if self.num_queries_per_kv == 1:
-            return x
-        b, t, kv_heads, d = x.shape
-        # Use repeat instead of expand to avoid memory bloat
-        return x.repeat_interleave(self.num_queries_per_kv, dim=2)
-    
 
     def forward(self, x, attention_mask=None):
         b, t, _ = x.shape
@@ -268,31 +247,34 @@ class Model5555LM(nn.Module):
             nn.init.ones_(module.weight)
 
     def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
-        # Fast path: skip dtype/type validation on repeated calls
-        # Assume inputs are pre-validated in a setup/initialization phase
+        if not isinstance(input_ids, torch.Tensor):
+            raise TypeError("input_ids must be a torch.Tensor")
+        if input_ids.ndim != 2:
+            raise ValueError(f"input_ids must have shape [B, T], got {tuple(input_ids.shape)}")
+        if input_ids.dtype != torch.long:
+            raise TypeError(f"input_ids must be torch.long, got {input_ids.dtype}")
         b, t = input_ids.shape
-    
-        # Only check dynamic bounds (required every call)
         if b <= 0 or t <= 0:
             raise ValueError("batch size and sequence length must be > 0")
         if t > self.config.max_seq_len:
             raise ValueError(f"sequence length {t} exceeds max_seq_len {self.config.max_seq_len}")
-    
-        # Quick attention_mask shape check (skip dtype conversion)
         if attention_mask is not None:
+            if not isinstance(attention_mask, torch.Tensor):
+                raise TypeError("attention_mask must be a torch.Tensor")
             if attention_mask.shape != input_ids.shape:
                 raise ValueError("attention_mask must have the same shape as input_ids")
-            # Skip expensive dtype/device checks — assume caller provided correct tensor
+            if attention_mask.device != input_ids.device:
+                raise ValueError("attention_mask and input_ids must be on the same device")
             if attention_mask.dtype == torch.bool:
-                pass  # Already correct
+                attention_mask = attention_mask.to(torch.bool)
+            elif attention_mask.is_floating_point() or attention_mask.dtype in (
+                torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
+            ):
+                attention_mask = attention_mask != 0
             else:
-                attention_mask = (attention_mask != 0).to(torch.bool)
-    
-        # Skip token range check (expensive min/max scan) in production
-        # Uncomment only during debugging:
-        # if input_ids.min() < 0 or input_ids.max() >= self.config.vocab_size:
-        #     raise ValueError(f"input_ids contains a token outside [0, {self.config.vocab_size})")
-        
+                raise TypeError("attention_mask must be boolean or numeric")
+        if input_ids.min() < 0 or input_ids.max() >= self.config.vocab_size:
+            raise ValueError(f"input_ids contains a token outside [0, {self.config.vocab_size})")
         x = self.embed_dropout(self.embed_tokens(input_ids))
         hidden_states = [] if output_hidden_states else None
         for layer in self.layers:
