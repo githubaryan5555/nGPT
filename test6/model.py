@@ -218,10 +218,15 @@ class Model5555LM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
         residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
-        for layer in self.layers:
-            nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
-            nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
 
+        for layer in self.layers:
+            # Initialize the attention output projection when available.
+            o_proj = getattr(layer.self_attn, "o_proj", None)
+            if o_proj is not None:
+                nn.init.normal_(o_proj.weight, std=residual_std)
+
+            # Preserve the original MLP residual initialization.
+            nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, std=self.config.initializer_range)
