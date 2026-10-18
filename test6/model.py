@@ -115,7 +115,7 @@ class RoPE(nn.Module):
         return torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1).flatten(-2)
 
 
-class GQAAttention(nn.Module):
+
 
 class GQAAttention(nn.Module):
     """FLA GLA with grouped KV heads and fused recurrent execution."""
