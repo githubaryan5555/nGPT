@@ -124,7 +124,7 @@ class GQAAttention(nn.Module):
         super().__init__()
 
         self.attn = GatedLinearAttention(
-            mode="chunk",
+            mode="fused_recurrent",
             hidden_size=config.hidden_size,
             expand_k=0.5,
             expand_v=1.0,
