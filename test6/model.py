@@ -124,7 +124,7 @@ class GQAAttention(nn.Module):
         super().__init__()
 
         self.attn = GatedLinearAttention(
-            mode="fused_recurrent",
+            mode="chunk",
             hidden_size=config.hidden_size,
             expand_k=0.5,
             expand_v=1.0,
@@ -161,7 +161,6 @@ class SwiGLU(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = GQAAttention(config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = SwiGLU(config)
@@ -169,7 +168,7 @@ class Block(nn.Module):
 
     def forward(self, x, attention_mask=None):
         x = x + self.hidden_dropout(
-            self.self_attn(self.input_layernorm(x), attention_mask)
+            self.self_attn(x, attention_mask)
         )
         x = x + self.hidden_dropout(
             self.mlp(self.post_attention_layernorm(x))
@@ -202,12 +201,21 @@ class Model5555LM(nn.Module):
         residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
 
         for layer in self.layers:
-            # Initialize the output projection only when this attention
-            # implementation exposes the original o_proj attribute.
-            if hasattr(layer.self_attn, "o_proj"):
-                nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
+            # GLA output projection is nested inside GatedLinearAttention.
+            gla = layer.self_attn.attn
 
-            nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
+            if hasattr(gla, "o_proj"):
+                nn.init.normal_(
+                    gla.o_proj.weight,
+                    std=residual_std,
+                )
+
+                nn.init.normal_(
+                layer.mlp.down_proj.weight,
+                std=residual_std,
+          )
+
+    
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, std=self.config.initializer_range)
