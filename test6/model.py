@@ -1,21 +1,4 @@
-"""Small decoder-only language model used by ``train.py``.
-
-Extended to optionally support hidden-state diffusion refinement (block
-refinement). This file keeps the original LM behavior unchanged but adds:
-
-- Config fields to control diffusion/refiner behavior.
-- encode_hidden() to return final normalized hidden states (B, T, D).
-- a small BlockRefinementDiffuser module that predicts noise on hidden states
-  conditioned on optional unmasked "cond_z" and a timestep.
-- convenience method setup_diffusion() which creates a diffusers
-  DDPMScheduler and instantiates the refiner when ``config.diffusion_enabled``
-  is True and ``diffusers`` is available.
-
-The refiner is intentionally small and simple: it operates per-token using
-an MLP with a timestep embedding and an optional linear projection for the
-conditioning hidden states. Training code should compute loss only on the
-masked tokens.
-"""
+"""Small decoder-only language model used by ``train.py``."""
 
 from dataclasses import asdict, dataclass
 import math
@@ -28,7 +11,7 @@ import torch.nn.functional as F
 
 try:
     from . import config as cfg
-except ImportError:  # Support running ``python test6/model.py`` directly.
+except ImportError:  # Support running ``python test4/model.py`` directly.
     import config as cfg
 
 
@@ -48,25 +31,11 @@ class Config:
     tie_word_embeddings: bool = cfg.tie_word_embeddings
     initializer_range: float = cfg.initializer_range
 
-    # Diffusion/refiner-related defaults
-    diffusion_enabled: bool = False
-    diffusion_num_train_timesteps: int = 1000
-    diffusion_num_inference_timesteps: int = 50
-    diffusion_beta_schedule: str = "linear"
-    diffusion_prediction_type: str = "epsilon"  # currently only 'epsilon' supported
-    diffusion_refiner_hidden_channels: int = 512
-    diffusion_refiner_layers: int = 4
-    diffusion_mask_ratio: float = 0.15
-    diffusion_loss_weight: float = 1.0
-    diffusion_ce_weight: float = 0.0
-
     def __post_init__(self):
         integer_fields = (
             "vocab_size", "hidden_size", "num_hidden_layers",
             "intermediate_size", "num_attention_heads",
             "num_key_value_heads", "max_seq_len",
-            "diffusion_num_train_timesteps", "diffusion_num_inference_timesteps",
-            "diffusion_refiner_layers",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -98,14 +67,6 @@ class Config:
                 raise ValueError(f"{name} must be finite and in [0, 1)")
         if not isinstance(self.tie_word_embeddings, bool):
             raise TypeError("tie_word_embeddings must be a bool")
-        if not isinstance(self.diffusion_enabled, bool):
-            raise TypeError("diffusion_enabled must be a bool")
-        if self.diffusion_prediction_type not in {"epsilon"}:
-            raise ValueError("currently only 'epsilon' prediction_type is supported")
-        if not isinstance(self.diffusion_loss_weight, Real) or not math.isfinite(self.diffusion_loss_weight) or self.diffusion_loss_weight < 0:
-            raise ValueError("diffusion_loss_weight must be finite and >= 0")
-        if not isinstance(self.diffusion_ce_weight, Real) or not math.isfinite(self.diffusion_ce_weight) or self.diffusion_ce_weight < 0:
-            raise ValueError("diffusion_ce_weight must be finite and >= 0")
 
     @property
     def head_dim(self):
@@ -248,89 +209,6 @@ class Block(nn.Module):
         return x
 
 
-class BlockRefinementDiffuser(nn.Module):
-    """Simple refiner that predicts noise on hidden states.
-
-    Design choices:
-    - Operates per-token (MLP applied to last dimension) for simplicity and
-      computational efficiency.
-    - Accepts cond_z (same shape as hidden states) which should contain the
-      unmasked clean hidden states, with zeros where masked. The refiner has a
-      linear projection for cond_z which will be added to the noisy input;
-      because cond_z is zeroed at masked positions, it only contributes at
-      unmasked positions as intended.
-    - Timesteps are embedded via a small MLP and added to token features.
-    - Returns predicted epsilon (noise) of shape (B, T, D).
-    """
-    def __init__(self, hidden_dim: int, max_seq_len: int, channels: int = 512, num_layers: int = 4):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.max_seq_len = max_seq_len
-        self.channels = channels
-        self.num_layers = num_layers
-
-        # time embedding
-        self.time_emb = nn.Sequential(
-            nn.Linear(1, channels),
-            nn.SiLU(),
-            nn.Linear(channels, channels),
-        )
-
-        # cond projection (maps cond_z -> hidden dim) and noisy input projection
-        self.cond_proj = nn.Linear(hidden_dim, channels, bias=False)
-        self.input_proj = nn.Linear(hidden_dim, channels, bias=False)
-
-        # core MLP (applied per token)
-        layers = []
-        for i in range(num_layers):
-            in_ch = channels if i == 0 else channels
-            layers.append(nn.Linear(in_ch, channels))
-            layers.append(nn.GELU())
-        self.core = nn.Sequential(*layers)
-
-        # output projection back to hidden_dim (predict epsilon)
-        self.output_proj = nn.Linear(channels, hidden_dim)
-
-    def forward(self, noisy_z, timesteps, cond_z=None, mask=None):
-        """Predict noise (epsilon) for noisy_z.
-
-        Args:
-            noisy_z: (B, T, D)
-            timesteps: (B,) int64 timesteps
-            cond_z: optional (B, T, D) with zeros where masked
-            mask: optional (B, T) boolean mask (True = masked positions)
-        Returns:
-            predicted_noise: (B, T, D)
-        """
-        b, t, d = noisy_z.shape
-        # normalize timesteps to float in [0,1]
-        if timesteps is None:
-            time_feat = torch.zeros((b, 1), device=noisy_z.device, dtype=noisy_z.dtype)
-        else:
-            timesteps = timesteps.to(device=noisy_z.device)
-            max_t = getattr(self, "num_train_timesteps", None)
-            if max_t is None:
-                # fall back to 1000 nominal if not set
-                max_t = 1000
-            time_feat = timesteps.float().unsqueeze(-1) / float(max_t)
-        # compute time embedding
-        te = self.time_emb(time_feat)  # (B, C)
-        # project noisy input and cond
-        inp = self.input_proj(noisy_z)  # (B, T, C)
-        # add cond projection (cond_z may be None)
-        if cond_z is None:
-            cond_proj = 0.0
-        else:
-            cond_proj = self.cond_proj(cond_z)  # (B, T, C)
-        # add time embedding to every token
-        te = te.unsqueeze(1)  # (B, 1, C)
-        h = inp + cond_proj + te
-        # core MLP: apply per-token
-        h = self.core(h)
-        out = self.output_proj(h)
-        return out
-
-
 class Model5555LM(nn.Module):
     """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``."""
 
@@ -350,11 +228,6 @@ class Model5555LM(nn.Module):
         self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # diffusion/refiner attributes - may be created by setup_diffusion
-        self.block_refiner: Optional[nn.Module] = None
-        self.diffusion_scheduler = None  # set by setup_diffusion when available
-
         self.apply(self._init_weights)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -362,15 +235,6 @@ class Model5555LM(nn.Module):
         for layer in self.layers:
             nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
             nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
-
-        # if diffusion requested at construction time, try to set it up now
-        if getattr(self.config, "diffusion_enabled", False):
-            try:
-                self.setup_diffusion()
-            except Exception:
-                # leave uninitialized; training script can call setup_diffusion()
-                # and will error with a clear message if diffusers is missing
-                pass
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -421,70 +285,6 @@ class Model5555LM(nn.Module):
         if output_hidden_states:
             return logits, hidden_states
         return logits
-
-    # New API for diffusion training ------------------------------------------------
-    def encode_hidden(self, input_ids, attention_mask=None):
-        """Return final normalized hidden states (B, T, D) used as diffusion space.
-
-        This is the tensor that the refiner denoises. It is the output of the LM
-        after applying the final RMSNorm but before the lm_head.
-        """
-        if not isinstance(input_ids, torch.Tensor):
-            raise TypeError("input_ids must be a torch.Tensor")
-        if input_ids.ndim != 2:
-            raise ValueError("input_ids must have shape [B, T]")
-        x = self.embed_dropout(self.embed_tokens(input_ids))
-        for layer in self.layers:
-            x = layer(x, attention_mask)
-        z = self.final_layernorm(x)
-        return z
-
-    def setup_diffusion(self, force=False):
-        """Instantiate diffusion scheduler and refiner if needed.
-
-        If diffusers is not installed this will raise an ImportError. The training
-        script can catch that and surface a friendly error message.
-        """
-        if self.block_refiner is not None and self.diffusion_scheduler is not None and not force:
-            return
-        if not getattr(self.config, "diffusion_enabled", False):
-            raise RuntimeError("config.diffusion_enabled is False; enable diffusion in config to setup refiner")
-        try:
-            from diffusers import DDPMScheduler
-        except Exception as exc:
-            raise ImportError("diffusers is required for diffusion functionality: pip install diffusers") from exc
-        # create scheduler
-        scheduler = DDPMScheduler(num_train_timesteps=self.config.diffusion_num_train_timesteps,
-                                  beta_schedule=self.config.diffusion_beta_schedule)
-        self.diffusion_scheduler = scheduler
-        # instantiate refiner
-        self.block_refiner = BlockRefinementDiffuser(self.config.hidden_size, self.config.max_seq_len,
-                                                      channels=self.config.diffusion_refiner_hidden_channels,
-                                                      num_layers=self.config.diffusion_refiner_layers)
-        # communicate num_train_timesteps to refiner (used for normalization of timesteps)
-        setattr(self.block_refiner, "num_train_timesteps", self.config.diffusion_num_train_timesteps)
-
-    def refine_hidden(self, noisy_z, timesteps, cond_z=None, mask=None):
-        """Run the block refiner to predict noise (epsilon) for noisy_z.
-
-        Args:
-            noisy_z: (B, T, D) noisy hidden states
-            timesteps: (B,) integer timesteps in [0, num_train_timesteps)
-            cond_z: optional (B, T, D) clean unmasked hidden states (zeros where masked)
-            mask: optional (B, T) boolean mask (True where masked)
-        Returns:
-            predicted_noise: (B, T, D)
-        """
-        if self.block_refiner is None:
-            raise RuntimeError("block_refiner is not initialized. Call setup_diffusion() first or set diffusion_enabled in config.")
-        # ensure shapes
-        if noisy_z.ndim != 3:
-            raise ValueError("noisy_z must have shape (B, T, D)")
-        if timesteps is None:
-            raise ValueError("timesteps must be provided for diffusion prediction")
-        return self.block_refiner(noisy_z, timesteps, cond_z=cond_z, mask=mask)
-
-    # end diffusion API -----------------------------------------------------------
 
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
