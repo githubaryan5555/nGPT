@@ -1,4 +1,20 @@
 """Small decoder-only language model used by ``train.py``.
+
+Extended to optionally support hidden-state diffusion refinement (block
+refinement). This file keeps the original LM behavior unchanged but adds:
+
+- Config fields to control diffusion/refiner behavior.
+- encode_hidden() to return final normalized hidden states (B, T, D).
+- a small BlockRefinementDiffuser module that predicts noise on hidden states
+  conditioned on optional unmasked "cond_z" and a timestep.
+- convenience method setup_diffusion() which creates a diffusers
+  DDPMScheduler and instantiates the refiner when ``config.diffusion_enabled``
+  is True and ``diffusers`` is available.
+
+The refiner is intentionally small and simple: it operates per-token using
+an MLP with a timestep embedding and an optional linear projection for the
+conditioning hidden states. Training code should compute loss only on the
+masked tokens.
 """
 
 from dataclasses import asdict, dataclass
@@ -10,16 +26,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Import the official diffusers scheduler for noise scheduling.
-# The repository running this code must have `diffusers` installed.
-try:
-    from diffusers import DDPMScheduler
-except Exception as e:
-    DDPMScheduler = None  # We'll raise a helpful error if used without installation.
-
 try:
     from . import config as cfg
-except ImportError:  # Support running ``python test4/model.py`` directly.
+except ImportError:  # Support running ``python test6/model.py`` directly.
     import config as cfg
 
 
@@ -39,26 +48,25 @@ class Config:
     tie_word_embeddings: bool = cfg.tie_word_embeddings
     initializer_range: float = cfg.initializer_range
 
-    # Diffusion / block-refinement settings (LLaDA-style masked continuous diffusion)
+    # Diffusion/refiner-related defaults
     diffusion_enabled: bool = False
     diffusion_num_train_timesteps: int = 1000
     diffusion_num_inference_timesteps: int = 50
-    diffusion_beta_schedule: str = "linear"  # passed to diffusers' DDPMScheduler
-    diffusion_prediction_type: str = "epsilon"  # "epsilon" or "x0"
+    diffusion_beta_schedule: str = "linear"
+    diffusion_prediction_type: str = "epsilon"  # currently only 'epsilon' supported
     diffusion_refiner_hidden_channels: int = 512
     diffusion_refiner_layers: int = 4
     diffusion_mask_ratio: float = 0.15
     diffusion_loss_weight: float = 1.0
     diffusion_ce_weight: float = 0.0
-    diffusion_freeze_base_model: bool = True
-    diffusion_classifier_free_prob: float = 0.0
-    diffusion_guidance_scale: float = 1.0
 
     def __post_init__(self):
         integer_fields = (
             "vocab_size", "hidden_size", "num_hidden_layers",
             "intermediate_size", "num_attention_heads",
             "num_key_value_heads", "max_seq_len",
+            "diffusion_num_train_timesteps", "diffusion_num_inference_timesteps",
+            "diffusion_refiner_layers",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -90,32 +98,14 @@ class Config:
                 raise ValueError(f"{name} must be finite and in [0, 1)")
         if not isinstance(self.tie_word_embeddings, bool):
             raise TypeError("tie_word_embeddings must be a bool")
-
-        # Diffusion validations
         if not isinstance(self.diffusion_enabled, bool):
             raise TypeError("diffusion_enabled must be a bool")
-        if not isinstance(self.diffusion_num_train_timesteps, int) or self.diffusion_num_train_timesteps <= 0:
-            raise ValueError("diffusion_num_train_timesteps must be an int > 0")
-        if not isinstance(self.diffusion_num_inference_timesteps, int) or self.diffusion_num_inference_timesteps <= 0:
-            raise ValueError("diffusion_num_inference_timesteps must be an int > 0")
-        if self.diffusion_prediction_type not in ("epsilon", "x0"):
-            raise ValueError("diffusion_prediction_type must be 'epsilon' or 'x0'")
-        if not isinstance(self.diffusion_refiner_hidden_channels, int) or self.diffusion_refiner_hidden_channels <= 0:
-            raise ValueError("diffusion_refiner_hidden_channels must be an int > 0")
-        if not isinstance(self.diffusion_refiner_layers, int) or self.diffusion_refiner_layers <= 0:
-            raise ValueError("diffusion_refiner_layers must be an int > 0")
-        if not (0.0 <= self.diffusion_mask_ratio <= 1.0):
-            raise ValueError("diffusion_mask_ratio must be in [0, 1]")
+        if self.diffusion_prediction_type not in {"epsilon"}:
+            raise ValueError("currently only 'epsilon' prediction_type is supported")
         if not isinstance(self.diffusion_loss_weight, Real) or not math.isfinite(self.diffusion_loss_weight) or self.diffusion_loss_weight < 0:
             raise ValueError("diffusion_loss_weight must be finite and >= 0")
         if not isinstance(self.diffusion_ce_weight, Real) or not math.isfinite(self.diffusion_ce_weight) or self.diffusion_ce_weight < 0:
             raise ValueError("diffusion_ce_weight must be finite and >= 0")
-        if not isinstance(self.diffusion_freeze_base_model, bool):
-            raise TypeError("diffusion_freeze_base_model must be a bool")
-        if not isinstance(self.diffusion_classifier_free_prob, Real) or not 0 <= self.diffusion_classifier_free_prob <= 1:
-            raise ValueError("diffusion_classifier_free_prob must be in [0, 1]")
-        if not isinstance(self.diffusion_guidance_scale, Real) or not math.isfinite(self.diffusion_guidance_scale) or self.diffusion_guidance_scale <= 0:
-            raise ValueError("diffusion_guidance_scale must be finite and > 0")
 
     @property
     def head_dim(self):
@@ -258,79 +248,88 @@ class Block(nn.Module):
         return x
 
 
-# ---------- Block refinement diffuser (simple Conv1D refiner + DDPMScheduler) ----------
-
-def _timestep_embedding(timesteps, dim: int):
-    """Build sinusoidal timestep embeddings."""
-    # timesteps: (B,) or scalar
-    if timesteps is None:
-        return None
-    # ensure tensor
-    if not torch.is_tensor(timesteps):
-        timesteps = torch.tensor(timesteps, dtype=torch.long)
-    half = dim // 2
-    emb = math.log(10000) / (half - 1)
-    emb = torch.exp(torch.arange(half, device=timesteps.device) * -emb)
-    emb = timesteps[:, None].float() * emb[None, :]
-    emb = torch.cat((emb.sin(), emb.cos()), dim=1)
-    if dim % 2 == 1:  # zero pad
-        emb = F.pad(emb, (0, 1))
-    return emb
-
-
 class BlockRefinementDiffuser(nn.Module):
-    """A small 1D convolutional refiner that predicts noise on hidden states.
+    """Simple refiner that predicts noise on hidden states.
 
-    This is a lightweight refiner used for masked continuous diffusion over
-    final hidden states. It predicts noise epsilon given noisy hidden states
-    and a timestep embedding. Conditioning (unmasked hidden states) can be
-    provided and is concatenated to the input channels.
+    Design choices:
+    - Operates per-token (MLP applied to last dimension) for simplicity and
+      computational efficiency.
+    - Accepts cond_z (same shape as hidden states) which should contain the
+      unmasked clean hidden states, with zeros where masked. The refiner has a
+      linear projection for cond_z which will be added to the noisy input;
+      because cond_z is zeroed at masked positions, it only contributes at
+      unmasked positions as intended.
+    - Timesteps are embedded via a small MLP and added to token features.
+    - Returns predicted epsilon (noise) of shape (B, T, D).
     """
-
-    def __init__(self, hidden_dim: int, seq_len: int, channels: int = 512, num_layers: int = 4):
+    def __init__(self, hidden_dim: int, max_seq_len: int, channels: int = 512, num_layers: int = 4):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.seq_len = seq_len
+        self.max_seq_len = max_seq_len
         self.channels = channels
         self.num_layers = num_layers
-        # timestep embedding -> channels
-        self.t_embed = nn.Sequential(nn.Linear(channels // 4, channels), nn.SiLU())
-        # input projection: project hidden_dim -> channels
-        self.input_proj = nn.Linear(hidden_dim, channels)
-        blocks = []
-        for _ in range(num_layers):
-            blocks.append(nn.Conv1d(channels, channels, kernel_size=3, padding=1))
-            blocks.append(nn.GroupNorm(8, channels))
-            blocks.append(nn.SiLU())
-        self.conv_blocks = nn.Sequential(*blocks)
-        self.out_proj = nn.Linear(channels, hidden_dim)
+
+        # time embedding
+        self.time_emb = nn.Sequential(
+            nn.Linear(1, channels),
+            nn.SiLU(),
+            nn.Linear(channels, channels),
+        )
+
+        # cond projection (maps cond_z -> hidden dim) and noisy input projection
+        self.cond_proj = nn.Linear(hidden_dim, channels, bias=False)
+        self.input_proj = nn.Linear(hidden_dim, channels, bias=False)
+
+        # core MLP (applied per token)
+        layers = []
+        for i in range(num_layers):
+            in_ch = channels if i == 0 else channels
+            layers.append(nn.Linear(in_ch, channels))
+            layers.append(nn.GELU())
+        self.core = nn.Sequential(*layers)
+
+        # output projection back to hidden_dim (predict epsilon)
+        self.output_proj = nn.Linear(channels, hidden_dim)
 
     def forward(self, noisy_z, timesteps, cond_z=None, mask=None):
-        # noisy_z: (B, T, D)
+        """Predict noise (epsilon) for noisy_z.
+
+        Args:
+            noisy_z: (B, T, D)
+            timesteps: (B,) int64 timesteps
+            cond_z: optional (B, T, D) with zeros where masked
+            mask: optional (B, T) boolean mask (True = masked positions)
+        Returns:
+            predicted_noise: (B, T, D)
+        """
         b, t, d = noisy_z.shape
-        assert d == self.hidden_dim, "hidden dim mismatch"
-        h = self.input_proj(noisy_z)  # (B, T, C)
-        h = h.transpose(1, 2)  # (B, C, T) for Conv1d
-        te = _timestep_embedding(timesteps if isinstance(timesteps, torch.Tensor) else torch.full((b,), timesteps, device=noisy_z.device), self.channels // 4)
-        te = self.t_embed(te)  # (B, C)
-        te = te[:, :, None]  # (B, C, 1)
-        # simple residual conv stack with timestep conditioning via addition
-        for layer in range(0, len(self.conv_blocks), 3):
-            conv = self.conv_blocks[layer]
-            gn = self.conv_blocks[layer + 1]
-            act = self.conv_blocks[layer + 2]
-            h = conv(h)
-            # add timestep embedding
-            h = h + te
-            h = gn(h)
-            h = act(h)
-        h = h.transpose(1, 2)  # (B, T, C)
-        out = self.out_proj(h)  # predict noise in hidden space: (B, T, D)
-        # Optionally mask out unconditioned positions in the output (trainer will use mask)
+        # normalize timesteps to float in [0,1]
+        if timesteps is None:
+            time_feat = torch.zeros((b, 1), device=noisy_z.device, dtype=noisy_z.dtype)
+        else:
+            timesteps = timesteps.to(device=noisy_z.device)
+            max_t = getattr(self, "num_train_timesteps", None)
+            if max_t is None:
+                # fall back to 1000 nominal if not set
+                max_t = 1000
+            time_feat = timesteps.float().unsqueeze(-1) / float(max_t)
+        # compute time embedding
+        te = self.time_emb(time_feat)  # (B, C)
+        # project noisy input and cond
+        inp = self.input_proj(noisy_z)  # (B, T, C)
+        # add cond projection (cond_z may be None)
+        if cond_z is None:
+            cond_proj = 0.0
+        else:
+            cond_proj = self.cond_proj(cond_z)  # (B, T, C)
+        # add time embedding to every token
+        te = te.unsqueeze(1)  # (B, 1, C)
+        h = inp + cond_proj + te
+        # core MLP: apply per-token
+        h = self.core(h)
+        out = self.output_proj(h)
         return out
 
-
-# -----------------------------------------------------------------------------------------
 
 class Model5555LM(nn.Module):
     """Causal language model with input/output shapes ``[B, T]`` and ``[B, T, V]``."""
@@ -352,21 +351,9 @@ class Model5555LM(nn.Module):
         self.final_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # If diffusion is enabled, build the block refiner and scheduler (requires diffusers)
-        if self.config.diffusion_enabled:
-            if DDPMScheduler is None:
-                raise ImportError("diffusers must be installed to enable diffusion features.\nInstall with `pip install diffusers`.")
-            # minimal scheduler setup
-            self.diffusion_scheduler = DDPMScheduler(num_train_timesteps=self.config.diffusion_num_train_timesteps,
-                                                     beta_schedule=self.config.diffusion_beta_schedule)
-            # small conv refiner that predicts noise in hidden space
-            self.block_refiner = BlockRefinementDiffuser(self.config.hidden_size,
-                                                         self.config.max_seq_len,
-                                                         channels=self.config.diffusion_refiner_hidden_channels,
-                                                         num_layers=self.config.diffusion_refiner_layers)
-        else:
-            self.diffusion_scheduler = None
-            self.block_refiner = None
+        # diffusion/refiner attributes - may be created by setup_diffusion
+        self.block_refiner: Optional[nn.Module] = None
+        self.diffusion_scheduler = None  # set by setup_diffusion when available
 
         self.apply(self._init_weights)
         if config.tie_word_embeddings:
@@ -375,6 +362,15 @@ class Model5555LM(nn.Module):
         for layer in self.layers:
             nn.init.normal_(layer.self_attn.o_proj.weight, std=residual_std)
             nn.init.normal_(layer.mlp.down_proj.weight, std=residual_std)
+
+        # if diffusion requested at construction time, try to set it up now
+        if getattr(self.config, "diffusion_enabled", False):
+            try:
+                self.setup_diffusion()
+            except Exception:
+                # leave uninitialized; training script can call setup_diffusion()
+                # and will error with a clear message if diffusers is missing
+                pass
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -386,85 +382,7 @@ class Model5555LM(nn.Module):
         elif isinstance(module, RMSNorm):
             nn.init.ones_(module.weight)
 
-    def encode_hidden(self, input_ids, attention_mask=None):
-        """Run the model up to final_layernorm and return continuous hidden states z (B, T, D)."""
-        if not isinstance(input_ids, torch.Tensor):
-            raise TypeError("input_ids must be a torch.Tensor")
-        if input_ids.ndim != 2:
-            raise ValueError(f"input_ids must have shape [B, T], got {tuple(input_ids.shape)}")
-        if input_ids.dtype != torch.long:
-            raise TypeError(f"input_ids must be torch.long, got {input_ids.dtype}")
-        b, t = input_ids.shape
-        if t > self.config.max_seq_len:
-            raise ValueError(f"sequence length {t} exceeds max_seq_len {self.config.max_seq_len}")
-        x = self.embed_dropout(self.embed_tokens(input_ids))
-        for layer in self.layers:
-            x = layer(x, attention_mask)
-        z = self.final_layernorm(x)
-        return z
-
-    def refine_hidden(self, noisy_z, timesteps, cond_z=None, mask=None):
-        """Call the block refiner to predict noise for noisy_z. Returns predicted noise tensor."""
-        if not self.config.diffusion_enabled or self.block_refiner is None:
-            raise RuntimeError("Diffusion/refinement is not enabled in this model instance")
-        return self.block_refiner(noisy_z, timesteps, cond_z, mask)
-
-    def _run_refinement_sampling(self, z, mask=None, num_inference_steps=None, guidance_scale: float = 1.0):
-        """Perform a simple reverse diffusion loop to refine z on masked positions.
-
-        This implementation uses the diffusers DDPMScheduler step API. It is a
-        minimal inference-time sampler: it starts from a noisy version of z at
-        the largest training timestep and iteratively denoises.
-        """
-        if self.diffusion_scheduler is None or self.block_refiner is None:
-            raise RuntimeError("Diffusion not configured")
-        device = z.device
-        b, t, d = z.shape
-        if mask is None:
-            mask = torch.ones((b, t), dtype=torch.bool, device=device)
-        if num_inference_steps is None:
-            num_inference_steps = self.config.diffusion_num_inference_timesteps
-        # set timesteps on scheduler
-        self.diffusion_scheduler.set_timesteps(num_inference_steps)
-        # start from a noisy version of z on masked positions
-        # sample Gaussian noise
-        noise = torch.randn_like(z)
-        # use maximum timestep index as starting point
-        init_t = self.diffusion_scheduler.timesteps[0]
-        # noisy input: only noise on masked positions, keep unmasked positions as clean conditioning
-        noisy_z = z.clone()
-        noisy_z[mask] = self.diffusion_scheduler.add_noise(z[mask], noise[mask], torch.tensor([int(init_t)], device=device))[0]
-        sample = noisy_z
-        # reversed timesteps
-        for tstep in self.diffusion_scheduler.timesteps:
-            # predict noise with block refiner
-            t_tensor = torch.full((b,), int(tstep), device=device, dtype=torch.long)
-            model_pred = self.block_refiner(sample, t_tensor, cond_z=z * (~mask)[..., None] if mask is not None else None, mask=mask)
-            # support classifier-free guidance by optionally running an unconditional pass
-            if guidance_scale != 1.0 and self.config.diffusion_classifier_free_prob > 0:
-                # run unconditional pass by zeroing cond (simple implementation)
-                model_pred_uncond = self.block_refiner(sample, t_tensor, cond_z=None, mask=mask)
-                model_pred = model_pred_uncond + guidance_scale * (model_pred - model_pred_uncond)
-            # scheduler step
-            step_output = self.diffusion_scheduler.step(model_pred, tstep, sample)
-            # step_output may be an object or dict; prefer attribute access
-            prev_sample = None
-            if hasattr(step_output, "prev_sample"):
-                prev_sample = step_output.prev_sample
-            elif isinstance(step_output, dict) and "prev_sample" in step_output:
-                prev_sample = step_output["prev_sample"]
-            elif isinstance(step_output, dict) and "sample" in step_output:
-                prev_sample = step_output["sample"]
-            else:
-                # fallback: assume step returns the new sample directly
-                prev_sample = step_output
-            sample = prev_sample
-        # after sampling, combine masked positions from sample with unmasked original z
-        refined = z.clone()
-        refined[mask] = sample[mask]
-        return refined
-
-    def forward(self, input_ids, attention_mask=None, output_hidden_states=False, use_refinement: bool = False, refinement_mask=None, refinement_steps: Optional[int] = None):
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
         if not isinstance(input_ids, torch.Tensor):
             raise TypeError("input_ids must be a torch.Tensor")
         if input_ids.ndim != 2:
@@ -499,25 +417,74 @@ class Model5555LM(nn.Module):
             x = layer(x, attention_mask)
             if output_hidden_states:
                 hidden_states.append(x)
-        z = self.final_layernorm(x)
-
-        # if refinement requested and diffusion enabled, run the refiner and then unembed
-        if use_refinement:
-            if not self.config.diffusion_enabled:
-                raise RuntimeError("use_refinement=True but diffusion is not enabled in config")
-            # default mask: refine all positions
-            if refinement_mask is None:
-                mask = torch.ones((b, t), dtype=torch.bool, device=z.device)
-            else:
-                mask = refinement_mask
-            refined_z = self._run_refinement_sampling(z, mask=mask, num_inference_steps=refinement_steps, guidance_scale=self.config.diffusion_guidance_scale)
-            logits = self.lm_head(refined_z)
-        else:
-            logits = self.lm_head(z)
-
+        logits = self.lm_head(self.final_layernorm(x))
         if output_hidden_states:
             return logits, hidden_states
         return logits
+
+    # New API for diffusion training ------------------------------------------------
+    def encode_hidden(self, input_ids, attention_mask=None):
+        """Return final normalized hidden states (B, T, D) used as diffusion space.
+
+        This is the tensor that the refiner denoises. It is the output of the LM
+        after applying the final RMSNorm but before the lm_head.
+        """
+        if not isinstance(input_ids, torch.Tensor):
+            raise TypeError("input_ids must be a torch.Tensor")
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must have shape [B, T]")
+        x = self.embed_dropout(self.embed_tokens(input_ids))
+        for layer in self.layers:
+            x = layer(x, attention_mask)
+        z = self.final_layernorm(x)
+        return z
+
+    def setup_diffusion(self, force=False):
+        """Instantiate diffusion scheduler and refiner if needed.
+
+        If diffusers is not installed this will raise an ImportError. The training
+        script can catch that and surface a friendly error message.
+        """
+        if self.block_refiner is not None and self.diffusion_scheduler is not None and not force:
+            return
+        if not getattr(self.config, "diffusion_enabled", False):
+            raise RuntimeError("config.diffusion_enabled is False; enable diffusion in config to setup refiner")
+        try:
+            from diffusers import DDPMScheduler
+        except Exception as exc:
+            raise ImportError("diffusers is required for diffusion functionality: pip install diffusers") from exc
+        # create scheduler
+        scheduler = DDPMScheduler(num_train_timesteps=self.config.diffusion_num_train_timesteps,
+                                  beta_schedule=self.config.diffusion_beta_schedule)
+        self.diffusion_scheduler = scheduler
+        # instantiate refiner
+        self.block_refiner = BlockRefinementDiffuser(self.config.hidden_size, self.config.max_seq_len,
+                                                      channels=self.config.diffusion_refiner_hidden_channels,
+                                                      num_layers=self.config.diffusion_refiner_layers)
+        # communicate num_train_timesteps to refiner (used for normalization of timesteps)
+        setattr(self.block_refiner, "num_train_timesteps", self.config.diffusion_num_train_timesteps)
+
+    def refine_hidden(self, noisy_z, timesteps, cond_z=None, mask=None):
+        """Run the block refiner to predict noise (epsilon) for noisy_z.
+
+        Args:
+            noisy_z: (B, T, D) noisy hidden states
+            timesteps: (B,) integer timesteps in [0, num_train_timesteps)
+            cond_z: optional (B, T, D) clean unmasked hidden states (zeros where masked)
+            mask: optional (B, T) boolean mask (True where masked)
+        Returns:
+            predicted_noise: (B, T, D)
+        """
+        if self.block_refiner is None:
+            raise RuntimeError("block_refiner is not initialized. Call setup_diffusion() first or set diffusion_enabled in config.")
+        # ensure shapes
+        if noisy_z.ndim != 3:
+            raise ValueError("noisy_z must have shape (B, T, D)")
+        if timesteps is None:
+            raise ValueError("timesteps must be provided for diffusion prediction")
+        return self.block_refiner(noisy_z, timesteps, cond_z=cond_z, mask=mask)
+
+    # end diffusion API -----------------------------------------------------------
 
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -562,7 +529,7 @@ class Model5555LM(nn.Module):
 
     @torch.no_grad()
     def generate(self, text, tokenizer, max_new_tokens=100, temperature=1.0,
-                 top_k=None, top_p=None, eos_token_id=None, do_sample=True, use_refinement: bool = False, refinement_steps: Optional[int] = None):
+                 top_k=None, top_p=None, eos_token_id=None, do_sample=True):
         if not isinstance(text, str):
             raise TypeError("text must be a string")
         if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
@@ -624,17 +591,6 @@ class Model5555LM(nn.Module):
                 output_ids = torch.cat((output_ids, next_token), dim=1)
                 if eos_token_id is not None and bool((next_token == eos_token_id).all()):
                     break
-            # after autoregressive sampling, optionally run refinement on the full sequence
-            if use_refinement:
-                # encode full sequence and run refinement
-                z = self.encode_hidden(output_ids, attention_mask=None)
-                b, t, d = z.shape
-                mask = torch.ones((b, t), dtype=torch.bool, device=z.device)  # default: refine all tokens
-                refined_z = self._run_refinement_sampling(z, mask=mask, num_inference_steps=refinement_steps)
-                logits = self.lm_head(refined_z)
-                # decode final tokens from refined logits (argmax)
-                final_ids = logits.argmax(dim=-1)[0].tolist()
-                return tokenizer.decode(final_ids)
         finally:
             self.train(was_training)
         return tokenizer.decode(output_ids[0].tolist())
