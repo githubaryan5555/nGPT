@@ -12,7 +12,7 @@
   "diffusion_ce_weight": 0.0,
   "diffusion_freeze_base_model": true,
   "diffusion_classifier_free_prob": 0.0,
-  "diffusion_guidance_scale": 1.0
+  "diffusion_guidance_scale": 1.0,
 
   "model_name": "model5555",
   "dataset_dir": "dataset",
