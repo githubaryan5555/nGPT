@@ -2,6 +2,13 @@
 This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
 
+This script now supports optional masked hidden-state diffusion training
+(if the model implements the diffusion interfaces added in test6/model.py).
+If the model has `config.diffusion_enabled == True` and provides
+`encode_hidden`, `block_refiner`, and `diffusion_scheduler`, the training
+loop will use masked continuous diffusion loss (LLaDA-style). Otherwise
+it falls back to the original autoregressive cross-entropy training.
+
 To run on a single GPU, example:
 $ python train.py --batch_size=32 --compile=False
 
@@ -216,12 +223,29 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
+    raw_model = model.module if ddp else model
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                # compute task-appropriate loss: diffusion-aware if available
+                if hasattr(raw_model, 'config') and getattr(raw_model.config, 'diffusion_enabled', False) and hasattr(raw_model, 'encode_hidden'):
+                    # diffusion-based eval: compute CE on lm_head for current hidden states
+                    z = raw_model.encode_hidden(X)
+                    logits = raw_model.lm_head(z)
+                    # compute token CE loss
+                    logits_flat = logits.view(-1, logits.size(-1))
+                    loss = torch.nn.functional.cross_entropy(logits_flat, Y.view(-1))
+                else:
+                    # fallback: original model returns (logits, loss) for autoregressive GPT
+                    out_val = model(X, Y)
+                    if isinstance(out_val, tuple) and len(out_val) == 2:
+                        _, loss = out_val
+                    else:
+                        # if model(X,Y) returned logits only, compute CE
+                        logits = out_val
+                        loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1))
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -297,7 +321,57 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            # If the raw model implements the diffusion refiner interfaces, compute diffusion loss
+            raw_model = model.module if ddp else model
+            if hasattr(raw_model, 'config') and getattr(raw_model.config, 'diffusion_enabled', False) and hasattr(raw_model, 'encode_hidden'):
+                # masked continuous hidden-state diffusion training
+                # 1) encode hidden
+                z = raw_model.encode_hidden(X)
+                b, t, d = z.shape
+                # 2) build mask (simple bernoulli token masking)
+                mask = torch.rand((b, t), device=z.device) < getattr(raw_model.config, 'diffusion_mask_ratio', 0.15)
+                any_mask = mask.any(dim=1)
+                for i in range(b):
+                    if not any_mask[i]:
+                        idx = torch.randint(0, t, (1,), device=z.device)
+                        mask[i, idx] = True
+                # 3) sample timesteps and noise
+                scheduler = raw_model.diffusion_scheduler
+                num_train_steps = scheduler.num_train_timesteps
+                timesteps = torch.randint(0, num_train_steps, (b,), device=z.device, dtype=torch.long)
+                noise = torch.randn_like(z)
+                # 4) noisy input using scheduler
+                noisy_full = scheduler.add_noise(z, noise, timesteps)
+                noisy_input = z.clone()
+                noisy_input[mask] = noisy_full[mask]
+                # cond: unmasked clean tokens
+                cond = z.clone()
+                cond[mask] = 0.0
+                # 5) predict noise with the refiner
+                pred = raw_model.refine_hidden(noisy_input, timesteps, cond_z=cond, mask=mask)
+                # 6) diffusion MSE on masked positions
+                diff_tensor = (pred - noise) ** 2
+                mask_exp = mask.unsqueeze(-1).expand_as(diff_tensor).float()
+                denom = mask_exp.sum()
+                diffusion_loss = (diff_tensor * mask_exp).sum() / (denom + 1e-8)
+                total_loss = raw_model.config.diffusion_loss_weight * diffusion_loss
+                # optional CE on reconstructed x0
+                if getattr(raw_model.config, 'diffusion_ce_weight', 0.0) > 0.0:
+                    x0_pred = scheduler.predict_start_from_noise(noisy_input, pred, timesteps)
+                    refined = z.clone()
+                    refined[mask] = x0_pred[mask]
+                    logits = raw_model.lm_head(refined)
+                    ce = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1))
+                    total_loss = total_loss + raw_model.config.diffusion_ce_weight * ce
+                # expose a scalar `loss` for logging/accumulation
+                loss = total_loss
+                logits = None
+            else:
+                # fallback to standard autoregressive training
+                logits, loss = model(X, Y)
+                # model may return logits only; if so compute CE
+                if not isinstance(loss, torch.Tensor):
+                    loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1))
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
