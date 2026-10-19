@@ -21,7 +21,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import config as cfg
 # Use the test6 model (Model5555LM) and its Config dataclass
-from test6.model import Config as ModelConfig, Model5555LM
+from model import Config as ModelConfig, Model5555LM
 
 
 def apply_cli():
