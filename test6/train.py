@@ -1,409 +1,471 @@
-"""
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
+"""DDP-capable trainer for Model5555LM.
 
-This script now supports optional masked hidden-state diffusion training
-(if the model implements the diffusion interfaces added in test6/model.py).
-If the model has `config.diffusion_enabled == True` and provides
-`encode_hidden`, `block_refiner`, and `diffusion_scheduler`, the training
-loop will use masked continuous diffusion loss (LLaDA-style). Otherwise
-it falls back to the original autoregressive cross-entropy training.
-
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
-
-To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
-
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
+The binary files are already tokenized. Configuration is loaded by config.py from
+config.json, while command-line ``--name=value`` arguments can override it.
 """
 
-import os
-import time
+import argparse
+import glob
+import json
 import math
-import pickle
+import os
+import re
+import time
 from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+import config as cfg
+# Use the test6 model (Model5555LM) and its Config dataclass
+from test6.model import Config as ModelConfig, Model5555LM
 
-# -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
-out_dir = 'out_fineweb'
-eval_interval = 100
-log_interval = 10
-eval_iters = 25
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'fw' # 'run' + str(time.time())
-# data
-dataset = 'fineweb'
-gradient_accumulation_steps = 4 * 4 # used to simulate larger batch sizes
-batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 256
-# model
-n_layer = 8
-n_head = 8
-n_embd = 256
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
-# adamw optimizer
-learning_rate = 1e-3 # max learning rate
-max_iters = 1000 # total number of training iterations
-weight_decay = 1e-1
-beta1 = 0.9
-beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-# learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 50 # how many steps to warm up for
-lr_decay_iters = 1000 # should be ~= max_iters per Chinchilla
-min_lr = 5e-4 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
-# system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
-# -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
-# -----------------------------------------------------------------------------
 
-# various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+def apply_cli():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--eval_only", action="store_true")
+    args, unknown = parser.parse_known_args()
+    aliases = {"compile": "compile_model", "decay_lr": "lr_decay"}
+    for item in unknown:
+        if not item.startswith("--") or "=" not in item:
+            continue
+        name, value = item[2:].split("=", 1)
+        name = aliases.get(name, name)
+        if not hasattr(cfg, name):
+            continue
+        old = getattr(cfg, name)
+        if isinstance(old, bool):
+            value = value.lower() in {"1", "true", "yes", "on"}
+        elif isinstance(old, int) and not isinstance(old, bool):
+            value = int(value)
+        elif isinstance(old, float):
+            value = float(value)
+        elif value.lower() == "none":
+            value = None
+        setattr(cfg, name, value)
+    if args.resume:
+        cfg.init_from = "resume"
+    if args.eval_only:
+        cfg.eval_only = True
+
+
+apply_cli()
+model_name = cfg.model_name
+dataset_dtype = np.dtype(cfg.dataset_dtype)
+if dataset_dtype.kind not in "iu":
+    raise ValueError("dataset_dtype must be an integer NumPy dtype")
+
+# DDP is initialized before any device-dependent work.
+ddp = int(os.environ.get("RANK", -1)) >= 0
 if ddp:
-    init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
+    dist.init_process_group(backend=cfg.backend)
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{local_rank}"
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
-    # world_size number of processes will be training simultaneously, so we can scale
-    # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
 else:
-    # if not ddp, we are running on a single gpu, and one process
-    master_process = True
-    seed_offset = 0
-    ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+    rank, local_rank, world_size = 0, 0, 1
+    device = cfg.device
+master_process = rank == 0
+if "cuda" in device and not torch.cuda.is_available():
+    raise RuntimeError("CUDA was requested but is unavailable")
+device_type = "cuda" if "cuda" in device else "cpu"
+if device_type == "cpu" and cfg.dtype != "float32":
+    dtype_name = "float32"
+else:
+    dtype_name = cfg.dtype
+ptdtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
+ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type="cuda", dtype=ptdtype)
+scaler = torch.amp.GradScaler("cuda", enabled=device_type == "cuda" and dtype_name == "float16")
 
+if cfg.gradient_accumulation_steps % world_size:
+    raise ValueError("gradient_accumulation_steps must be divisible by world size")
+local_grad_accum = cfg.gradient_accumulation_steps // world_size
+max_seq_len = cfg.max_seq_len
+batch_size = cfg.batch_size
+tokens_per_step = cfg.gradient_accumulation_steps * batch_size * max_seq_len
 if master_process:
-    os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-# note: float16 data type will automatically use a GradScaler
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    print(f"device={device}, world_size={world_size}, dtype={dtype_name}")
+    print(f"tokens per optimizer step={tokens_per_step:,}")
 
-# poor man's data loader
-data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+torch.manual_seed(cfg.seed + rank)
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
-# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
+# Keep each memmap open and use vectorized windows; this removes the old per-sample
+# Python slicing/astype loop, which was a significant input pipeline bottleneck.
+class TokenBatches:
+    def __init__(self):
+        self.maps = {}
+        for split, path in (("train", cfg.train_bin), ("val", cfg.val_bin)):
+            if not os.path.isfile(path):
+                raise FileNotFoundError(path)
+            data = np.memmap(path, dtype=dataset_dtype, mode="r")
+            if len(data) <= max_seq_len:
+                raise ValueError(f"{path} must contain more than max_seq_len tokens")
+            self.maps[split] = data
+
+    def get(self, split):
+        data = self.maps[split]
+        starts = torch.randint(0, len(data) - max_seq_len, (batch_size,)).numpy()
+        offsets = np.arange(max_seq_len + 1, dtype=np.int64)
+        windows = np.asarray(data[starts[:, None] + offsets[None, :]], dtype=np.int64)
+        x = torch.from_numpy(windows[:, :-1].copy())
+        y = torch.from_numpy(windows[:, 1:].copy())
+        if device_type == "cuda":
+            x = x.pin_memory().to(device, non_blocking=True)
+            y = y.pin_memory().to(device, non_blocking=True)
+        else:
+            x, y = x.to(device), y.to(device)
+        return x, y
+
+
+batches = TokenBatches()
+
+
+def model_values():
+    # Base LM architecture values from cfg
+    base = {
+        "vocab_size": cfg.vocab_size,
+        "hidden_size": cfg.hidden_size,
+        "num_hidden_layers": cfg.num_hidden_layers,
+        "intermediate_size": cfg.intermediate_size,
+        "num_attention_heads": cfg.num_attention_heads,
+        "num_key_value_heads": cfg.num_key_value_heads,
+        "attention_dropout": cfg.attention_dropout,
+        "hidden_dropout": cfg.hidden_dropout,
+        "rms_norm_eps": cfg.rms_norm_eps,
+        "rope_theta": cfg.rope_theta,
+        "tie_word_embeddings": cfg.tie_word_embeddings,
+        "initializer_range": cfg.initializer_range,
+        "max_seq_len": max_seq_len,
+    }
+    # diffusion keys (if present in cfg) - keep defaults in ModelConfig if missing
+    diffusion_keys = (
+        "diffusion_enabled",
+        "diffusion_num_train_timesteps",
+        "diffusion_num_inference_timesteps",
+        "diffusion_beta_schedule",
+        "diffusion_prediction_type",
+        "diffusion_refiner_hidden_channels",
+        "diffusion_refiner_layers",
+        "diffusion_mask_ratio",
+        "diffusion_loss_weight",
+        "diffusion_ce_weight",
+    )
+    for k in diffusion_keys:
+        if hasattr(cfg, k):
+            base[k] = getattr(cfg, k)
+    return base
+
+
+def make_model(values=None):
+    args = model_values()
+    if values:
+        args.update(values)
+    return Model5555LM(ModelConfig(**args))
+
+
+def checkpoint_files():
+    pattern = os.path.join(cfg.out_dir, f"{model_name}_ckpt_*.pt")
+    files = []
+    for path in glob.glob(pattern):
+        match = re.search(r"_(\d+)\.pt$", path)
+        if match:
+            files.append((int(match.group(1)), path))
+    files.sort()
+    return files
+
+
+def latest_checkpoint():
+    files = checkpoint_files()
+    if files:
+        return files[-1][1]
+    legacy = os.path.join(cfg.out_dir, cfg.checkpoint_name)
+    return legacy if os.path.isfile(legacy) else None
+
+
 iter_num = 0
-best_val_loss = 1e9
+best_val_loss = float("inf")
+checkpoint = None
+if cfg.init_from == "resume":
+    path = latest_checkpoint()
+    if path is None:
+        raise FileNotFoundError(f"No checkpoint found in {cfg.out_dir}")
+    if master_process:
+        print(f"resuming from {path}")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    model = make_model(checkpoint.get("model_args"))
+    state = {key.removeprefix("_orig_mod."): value for key, value in checkpoint["model"].items()}
+    model.load_state_dict(state)
+    iter_num = int(checkpoint.get("iter_num", checkpoint.get("step", 0)))
+    best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+else:
+    model = make_model()
 
-# attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-
-# model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
-if init_from == 'scratch':
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
+if master_process and cfg.print_model_info:
+    print(f"parameters={model.get_num_params():,}, fp16 size={model.get_model_size_mb():.8g} MB")
 
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+decay, no_decay = [], []
+for parameter in model.parameters():
+    if parameter.requires_grad:
+        (decay if parameter.ndim >= 2 else no_decay).append(parameter)
+fused = device_type == "cuda" and "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
+optimizer = torch.optim.AdamW(
+    [{"params": decay, "weight_decay": cfg.weight_decay}, {"params": no_decay, "weight_decay": 0.0}],
+    lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), fused=fused)
+if checkpoint is not None and "optimizer" in checkpoint:
+    optimizer.load_state_dict(checkpoint["optimizer"])
 
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None # free up memory
-
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
-
-# wrap model into DDP container
+if cfg.compile_model:
+    model = torch.compile(model)
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model = DDP(model, device_ids=[local_rank])
+raw_model = model.module if ddp else model
 
-# helps estimate an arbitrarily accurate loss over either split using many batches
+
+def language_loss(logits, targets):
+    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+
+
 @torch.no_grad()
 def estimate_loss():
-    out = {}
-    model.eval()
-    raw_model = model.module if ddp else model
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
+    """Every rank evaluates, then all ranks receive the same global averages."""
+    raw_model.eval()
+    totals = torch.zeros(2, device=device, dtype=torch.float64)
+    for index, split in enumerate(("train", "val")):
+        acc = 0.0
+        for _ in range(cfg.eval_iters):
+            X, Y = batches.get(split)
             with ctx:
-                # compute task-appropriate loss: diffusion-aware if available
-                if hasattr(raw_model, 'config') and getattr(raw_model.config, 'diffusion_enabled', False) and hasattr(raw_model, 'encode_hidden'):
-                    # diffusion-based eval: compute CE on lm_head for current hidden states
-                    z = raw_model.encode_hidden(X)
-                    logits = raw_model.lm_head(z)
-                    # compute token CE loss
-                    logits_flat = logits.view(-1, logits.size(-1))
-                    loss = torch.nn.functional.cross_entropy(logits_flat, Y.view(-1))
-                else:
-                    # fallback: original model returns (logits, loss) for autoregressive GPT
-                    out_val = model(X, Y)
-                    if isinstance(out_val, tuple) and len(out_val) == 2:
-                        _, loss = out_val
-                    else:
-                        # if model(X,Y) returned logits only, compute CE
-                        logits = out_val
-                        loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1))
-            losses[k] = loss.item()
-    model.train()
-    return out
+                # Always obtain logits via forward(X) and compute token CE
+                logits = raw_model(X)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1))
+            acc += loss.detach().double().item()
+        totals[index] = acc
+    if ddp:
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    totals = totals / (cfg.eval_iters * world_size)
+    raw_model.train()
+    return {"train": totals[0].item(), "val": totals[1].item()}
 
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
 
-# logging
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+def get_lr(step):
+    if not cfg.lr_decay:
+        return cfg.learning_rate
+    if step < cfg.warmup_iters:
+        return cfg.learning_rate * (step + 1) / (cfg.warmup_iters + 1)
+    if step >= cfg.lr_decay_iters:
+        return cfg.min_lr
+    ratio = (step - cfg.warmup_iters) / (cfg.lr_decay_iters - cfg.warmup_iters)
+    return cfg.min_lr + 0.5 * (1.0 + math.cos(math.pi * ratio)) * (cfg.learning_rate - cfg.min_lr)
 
-# training loop
-X, Y = get_batch('train') # fetch the very first batch
-t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
-running_mfu = -1.0
-while True:
 
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+# Optional tokenizer is used only for samples. The adapter supplies the interface
+# expected by Model5555LM.generate().
+tokenizer = None
+if os.path.isfile(cfg.tokenizer_path):
+    try:
+        from tokenizers import Tokenizer
+        backend_tokenizer = Tokenizer.from_file(cfg.tokenizer_path)
+        class TokenizerAdapter:
+            def encode(self, text):
+                return backend_tokenizer.encode(text).ids
+            def decode(self, ids):
+                return backend_tokenizer.decode(ids, skip_special_tokens=True)
+        tokenizer = TokenizerAdapter()
+    except (ImportError, Exception) as exc:
+        if master_process:
+            print(f"warning: tokenizer unavailable ({exc})")
 
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+
+def sample_text():
+    if tokenizer is None or not master_process:
+        return
+    was_training = raw_model.training
+    raw_model.eval()
+    print("samples:")
+    for number in range(cfg.sample_count):
+        source, _ = batches.get("val")
+        prompt_ids = source[0, :min(cfg.sample_prompt_tokens, max_seq_len)].cpu().tolist()
+        prompt = tokenizer.decode(prompt_ids)
+        try:
+            output = raw_model.generate(prompt, tokenizer, max_new_tokens=cfg.sample_new_tokens,
+                                        temperature=cfg.sample_temperature, top_k=cfg.sample_top_k,
+                                        top_p=cfg.sample_top_p, eos_token_id=cfg.eos_token_id)
+            print(f"  [{number + 1}] {output}")
+        except Exception as exc:
+            print(f"  [{number + 1}] generation failed: {exc}")
+    raw_model.train(was_training)
+
+
+def save_checkpoint(step, val_loss):
+    if not master_process or not cfg.save_checkpoint:
+        return
+    payload = {"model": raw_model.state_dict(), "optimizer": optimizer.state_dict(),
+               "model_args": raw_model.get_config(), "iter_num": step,
+               "best_val_loss": val_loss, "config": cfg.as_dict(),
+               "rng_state": torch.get_rng_state()}
+    path = os.path.join(cfg.out_dir, f"{model_name}_ckpt_{step}.pt")
+    temporary = path + f".tmp.{os.getpid()}"
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+    # stable pointer
+    latest = os.path.join(cfg.out_dir, f"{model_name}_latest.pt")
+    latest_tmp = latest + f".tmp.{os.getpid()}"
+    torch.save(payload, latest_tmp)
+    os.replace(latest_tmp, latest)
+    if master_process:
+        print(f"saved checkpoint: {path}")
+
+
+X, Y = batches.get("train")
+last_time = time.perf_counter()
+local_step = 0
+running_mfu = None
+while iter_num < cfg.max_iters:
+    lr = get_lr(iter_num)
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+    if iter_num % cfg.eval_interval == 0:
+        # This collective must be called by every rank. Only rank zero prints/saves.
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
+        if master_process:
+            print(f"step={iter_num:06d} train_loss={losses['train']:.16g} "
+                  f"val_loss={losses['val']:.16g} lr={lr:.16g}")
+            sample_text()
+            improved = losses["val"] < best_val_loss
+            if improved:
+                best_val_loss = losses["val"]
+            if iter_num > 0 and (improved or cfg.always_save_checkpoint):
+                save_checkpoint(iter_num, best_val_loss)
+        if ddp:
+            dist.barrier()
+    if iter_num == 0 and cfg.eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
+    step_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    for micro_step in range(local_grad_accum):
         if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            model.require_backward_grad_sync = micro_step == local_grad_accum - 1
         with ctx:
-            # If the raw model implements the diffusion refiner interfaces, compute diffusion loss
-            raw_model = model.module if ddp else model
-            if hasattr(raw_model, 'config') and getattr(raw_model.config, 'diffusion_enabled', False) and hasattr(raw_model, 'encode_hidden'):
-                # masked continuous hidden-state diffusion training
-                # 1) encode hidden
-                z = raw_model.encode_hidden(X)
+            raw = model.module if ddp else model
+            if getattr(raw.config, "diffusion_enabled", False):
+                # Ensure diffusion components exist
+                if raw.block_refiner is None or raw.diffusion_scheduler is None:
+                    # try to set up (will raise a helpful error if diffusers missing)
+                    raw.setup_diffusion()
+
+                # 1) encode hidden states
+                z = raw.encode_hidden(X)  # (B, T, D)
                 b, t, d = z.shape
-                # 2) build mask (simple bernoulli token masking)
-                mask = torch.rand((b, t), device=z.device) < getattr(raw_model.config, 'diffusion_mask_ratio', 0.15)
+
+                # 2) sample mask (Bernoulli) and ensure at least one masked token per sample
+                mask_ratio = float(getattr(raw.config, "diffusion_mask_ratio", cfg.diffusion_mask_ratio if hasattr(cfg, "diffusion_mask_ratio") else 0.15))
+                mask = (torch.rand((b, t), device=z.device) < mask_ratio)
                 any_mask = mask.any(dim=1)
                 for i in range(b):
                     if not any_mask[i]:
                         idx = torch.randint(0, t, (1,), device=z.device)
                         mask[i, idx] = True
+                mask = mask.to(torch.bool)
+
                 # 3) sample timesteps and noise
-                scheduler = raw_model.diffusion_scheduler
-                num_train_steps = scheduler.num_train_timesteps
+                num_train_steps = int(getattr(raw.config, "diffusion_num_train_timesteps", cfg.diffusion_num_train_timesteps if hasattr(cfg, "diffusion_num_train_timesteps") else 1000))
                 timesteps = torch.randint(0, num_train_steps, (b,), device=z.device, dtype=torch.long)
                 noise = torch.randn_like(z)
-                # 4) noisy input using scheduler
-                noisy_full = scheduler.add_noise(z, noise, timesteps)
+
+                # 4) produce noisy inputs and conditional context
+                noisy_full = raw.diffusion_scheduler.add_noise(z, noise, timesteps)
                 noisy_input = z.clone()
                 noisy_input[mask] = noisy_full[mask]
-                # cond: unmasked clean tokens
-                cond = z.clone()
-                cond[mask] = 0.0
-                # 5) predict noise with the refiner
-                pred = raw_model.refine_hidden(noisy_input, timesteps, cond_z=cond, mask=mask)
-                # 6) diffusion MSE on masked positions
-                diff_tensor = (pred - noise) ** 2
+
+                cond_z = z.clone()
+                cond_z[mask] = 0.0  # zeros where masked
+
+                # 5) predict noise with the refiner (cond_z passed explicitly)
+                pred = raw.refine_hidden(noisy_input, timesteps, cond_z=cond_z, mask=mask)  # (B, T, D)
+
+                # 6) diffusion loss only on masked positions
+                diff_tensor = (pred - noise) ** 2  # (B, T, D)
                 mask_exp = mask.unsqueeze(-1).expand_as(diff_tensor).float()
                 denom = mask_exp.sum()
                 diffusion_loss = (diff_tensor * mask_exp).sum() / (denom + 1e-8)
-                total_loss = raw_model.config.diffusion_loss_weight * diffusion_loss
-                # optional CE on reconstructed x0
-                if getattr(raw_model.config, 'diffusion_ce_weight', 0.0) > 0.0:
-                    x0_pred = scheduler.predict_start_from_noise(noisy_input, pred, timesteps)
+
+                total_loss = float(getattr(raw.config, "diffusion_loss_weight", cfg.diffusion_loss_weight if hasattr(cfg, "diffusion_loss_weight") else 1.0)) * diffusion_loss
+
+                # Optional CE on predicted x0 (only if configured)
+                ce_weight = float(getattr(raw.config, "diffusion_ce_weight", cfg.diffusion_ce_weight if hasattr(cfg, "diffusion_ce_weight") else 0.0))
+                if ce_weight and ce_weight > 0.0:
+                    # predict start (x0) from noisy + predicted noise
+                    # diffusers API: predict_start_from_noise(sample, noise, timestep)
+                    try:
+                        x0_pred = raw.diffusion_scheduler.predict_start_from_noise(noisy_input, pred, timesteps)
+                    except TypeError:
+                        # some versions have different arg order; try alternate
+                        x0_pred = raw.diffusion_scheduler.predict_start_from_noise(pred, noisy_input, timesteps)
                     refined = z.clone()
                     refined[mask] = x0_pred[mask]
-                    logits = raw_model.lm_head(refined)
-                    ce = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1))
-                    total_loss = total_loss + raw_model.config.diffusion_ce_weight * ce
-                # expose a scalar `loss` for logging/accumulation
-                loss = total_loss
-                logits = None
+                    logits = raw.lm_head(refined)
+                    per_tok_ce = F.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1), reduction="none").view(b, t)
+                    ce_masked = (per_tok_ce * mask.float()).sum() / (mask.float().sum() + 1e-8)
+                    total_loss = total_loss + ce_weight * ce_masked
+
+                # expose scalar loss for accumulation
+                micro_loss = total_loss
+                loss = micro_loss / local_grad_accum
             else:
-                # fallback to standard autoregressive training
-                logits, loss = model(X, Y)
-                # model may return logits only; if so compute CE
-                if not isinstance(loss, torch.Tensor):
-                    loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1))
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
+                # Standard autoregressive training: forward returns logits
+                logits = raw(X)
+                micro_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1))
+                loss = micro_loss / local_grad_accum
+
+        step_loss_sum += micro_loss.detach().double()
+        X, Y = batches.get("train")
         scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
+
+    if cfg.grad_clip:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+    if ddp:
+        dist.all_reduce(step_loss_sum, op=dist.ReduceOp.SUM)
+    average_step_loss = (step_loss_sum / (local_grad_accum * world_size)).item()
+    now = time.perf_counter()
+    elapsed = now - last_time
+    last_time = now
+    if iter_num % cfg.log_interval == 0 and master_process:
+        tokens_per_second = tokens_per_step / max(elapsed, 1e-9)
+        flops_per_token = raw_model.get_flops_per_token(max_seq_len)
+        flops_per_second = tokens_per_second * flops_per_token
+        mfu_text = "n/a"
+        if cfg.peak_flops:
+            try:
+                mfu = raw_model.estimate_mfu(tokens_per_second, cfg.peak_flops)
+                running_mfu = mfu if running_mfu is None else 0.9 * running_mfu + 0.1 * mfu
+                mfu_text = f"{running_mfu:.8g}%"
+            except Exception:
+                mfu_text = "n/a"
+        print(f"iter={iter_num:06d} loss={average_step_loss:.16g} "
+              f"time={elapsed:.8g}s tokens/s={tokens_per_second:.8g} "
+              f"FLOP/token={flops_per_token:.8g} FLOP/s={flops_per_second:.8g} MFU={mfu_text}")
     iter_num += 1
-    local_iter_num += 1
+    local_step += 1
 
-    # termination conditions
-    if iter_num > max_iters:
-        break
-
+# max_iters is an exclusive update count: max_iters=1000 performs steps 0..999.
+if master_process and cfg.save_checkpoint and iter_num > 0:
+    save_checkpoint(iter_num, best_val_loss)
 if ddp:
-    destroy_process_group()
+    dist.destroy_process_group()
