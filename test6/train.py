@@ -20,8 +20,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import config as cfg
-# Use the test6 model (Model5555LM) and its Config dataclass
-from model import Config as ModelConfig, Model5555LM
+from model import Config, Model5555LM
 
 
 def apply_cli():
@@ -131,46 +130,18 @@ batches = TokenBatches()
 
 
 def model_values():
-    # Base LM architecture values from cfg
-    base = {
-        "vocab_size": cfg.vocab_size,
-        "hidden_size": cfg.hidden_size,
-        "num_hidden_layers": cfg.num_hidden_layers,
-        "intermediate_size": cfg.intermediate_size,
-        "num_attention_heads": cfg.num_attention_heads,
-        "num_key_value_heads": cfg.num_key_value_heads,
-        "attention_dropout": cfg.attention_dropout,
-        "hidden_dropout": cfg.hidden_dropout,
-        "rms_norm_eps": cfg.rms_norm_eps,
-        "rope_theta": cfg.rope_theta,
-        "tie_word_embeddings": cfg.tie_word_embeddings,
-        "initializer_range": cfg.initializer_range,
-        "max_seq_len": max_seq_len,
-    }
-    # diffusion keys (if present in cfg) - keep defaults in ModelConfig if missing
-    diffusion_keys = (
-        "diffusion_enabled",
-        "diffusion_num_train_timesteps",
-        "diffusion_num_inference_timesteps",
-        "diffusion_beta_schedule",
-        "diffusion_prediction_type",
-        "diffusion_refiner_hidden_channels",
-        "diffusion_refiner_layers",
-        "diffusion_mask_ratio",
-        "diffusion_loss_weight",
-        "diffusion_ce_weight",
-    )
-    for k in diffusion_keys:
-        if hasattr(cfg, k):
-            base[k] = getattr(cfg, k)
-    return base
+    return {name: getattr(cfg, name) for name in (
+        "vocab_size", "hidden_size", "num_hidden_layers", "intermediate_size",
+        "num_attention_heads", "num_key_value_heads", "attention_dropout",
+        "hidden_dropout", "rms_norm_eps", "rope_theta", "tie_word_embeddings",
+        "initializer_range") } | {"max_seq_len": max_seq_len}
 
 
 def make_model(values=None):
     args = model_values()
     if values:
         args.update(values)
-    return Model5555LM(ModelConfig(**args))
+    return Model5555LM(Config(**args))
 
 
 def checkpoint_files():
@@ -239,22 +210,18 @@ def language_loss(logits, targets):
 @torch.no_grad()
 def estimate_loss():
     """Every rank evaluates, then all ranks receive the same global averages."""
-    raw_model.eval()
+    model.eval()
     totals = torch.zeros(2, device=device, dtype=torch.float64)
     for index, split in enumerate(("train", "val")):
-        acc = 0.0
         for _ in range(cfg.eval_iters):
-            X, Y = batches.get(split)
+            x, y = batches.get(split)
             with ctx:
-                # Always obtain logits via forward(X) and compute token CE
-                logits = raw_model(X)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1))
-            acc += loss.detach().double().item()
-        totals[index] = acc
+                value = language_loss(model(x), y)
+            totals[index] += value.detach().double()
     if ddp:
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-    totals = totals / (cfg.eval_iters * world_size)
-    raw_model.train()
+    totals /= cfg.eval_iters * world_size
+    model.train()
     return {"train": totals[0].item(), "val": totals[1].item()}
 
 
@@ -318,13 +285,13 @@ def save_checkpoint(step, val_loss):
     temporary = path + f".tmp.{os.getpid()}"
     torch.save(payload, temporary)
     os.replace(temporary, path)
-    # stable pointer
+    # A stable pointer makes external resume tooling simple while numbered files
+    # remain available for rollback.
     latest = os.path.join(cfg.out_dir, f"{model_name}_latest.pt")
     latest_tmp = latest + f".tmp.{os.getpid()}"
     torch.save(payload, latest_tmp)
     os.replace(latest_tmp, latest)
-    if master_process:
-        print(f"saved checkpoint: {path}")
+    print(f"saved checkpoint: {path}")
 
 
 X, Y = batches.get("train")
@@ -358,81 +325,12 @@ while iter_num < cfg.max_iters:
         if ddp:
             model.require_backward_grad_sync = micro_step == local_grad_accum - 1
         with ctx:
-            raw = model.module if ddp else model
-            if getattr(raw.config, "diffusion_enabled", False):
-                # Ensure diffusion components exist
-                if raw.block_refiner is None or raw.diffusion_scheduler is None:
-                    # try to set up (will raise a helpful error if diffusers missing)
-                    raw.setup_diffusion()
-
-                # 1) encode hidden states
-                z = raw.encode_hidden(X)  # (B, T, D)
-                b, t, d = z.shape
-
-                # 2) sample mask (Bernoulli) and ensure at least one masked token per sample
-                mask_ratio = float(getattr(raw.config, "diffusion_mask_ratio", cfg.diffusion_mask_ratio if hasattr(cfg, "diffusion_mask_ratio") else 0.15))
-                mask = (torch.rand((b, t), device=z.device) < mask_ratio)
-                any_mask = mask.any(dim=1)
-                for i in range(b):
-                    if not any_mask[i]:
-                        idx = torch.randint(0, t, (1,), device=z.device)
-                        mask[i, idx] = True
-                mask = mask.to(torch.bool)
-
-                # 3) sample timesteps and noise
-                num_train_steps = int(getattr(raw.config, "diffusion_num_train_timesteps", cfg.diffusion_num_train_timesteps if hasattr(cfg, "diffusion_num_train_timesteps") else 1000))
-                timesteps = torch.randint(0, num_train_steps, (b,), device=z.device, dtype=torch.long)
-                noise = torch.randn_like(z)
-
-                # 4) produce noisy inputs and conditional context
-                noisy_full = raw.diffusion_scheduler.add_noise(z, noise, timesteps)
-                noisy_input = z.clone()
-                noisy_input[mask] = noisy_full[mask]
-
-                cond_z = z.clone()
-                cond_z[mask] = 0.0  # zeros where masked
-
-                # 5) predict noise with the refiner (cond_z passed explicitly)
-                pred = raw.refine_hidden(noisy_input, timesteps, cond_z=cond_z, mask=mask)  # (B, T, D)
-
-                # 6) diffusion loss only on masked positions
-                diff_tensor = (pred - noise) ** 2  # (B, T, D)
-                mask_exp = mask.unsqueeze(-1).expand_as(diff_tensor).float()
-                denom = mask_exp.sum()
-                diffusion_loss = (diff_tensor * mask_exp).sum() / (denom + 1e-8)
-
-                total_loss = float(getattr(raw.config, "diffusion_loss_weight", cfg.diffusion_loss_weight if hasattr(cfg, "diffusion_loss_weight") else 1.0)) * diffusion_loss
-
-                # Optional CE on predicted x0 (only if configured)
-                ce_weight = float(getattr(raw.config, "diffusion_ce_weight", cfg.diffusion_ce_weight if hasattr(cfg, "diffusion_ce_weight") else 0.0))
-                if ce_weight and ce_weight > 0.0:
-                    # predict start (x0) from noisy + predicted noise
-                    # diffusers API: predict_start_from_noise(sample, noise, timestep)
-                    try:
-                        x0_pred = raw.diffusion_scheduler.predict_start_from_noise(noisy_input, pred, timesteps)
-                    except TypeError:
-                        # some versions have different arg order; try alternate
-                        x0_pred = raw.diffusion_scheduler.predict_start_from_noise(pred, noisy_input, timesteps)
-                    refined = z.clone()
-                    refined[mask] = x0_pred[mask]
-                    logits = raw.lm_head(refined)
-                    per_tok_ce = F.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1), reduction="none").view(b, t)
-                    ce_masked = (per_tok_ce * mask.float()).sum() / (mask.float().sum() + 1e-8)
-                    total_loss = total_loss + ce_weight * ce_masked
-
-                # expose scalar loss for accumulation
-                micro_loss = total_loss
-                loss = micro_loss / local_grad_accum
-            else:
-                # Standard autoregressive training: forward returns logits
-                logits = raw(X)
-                micro_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1))
-                loss = micro_loss / local_grad_accum
-
+            logits = model(X)
+            micro_loss = language_loss(logits, Y)
+            loss = micro_loss / local_grad_accum
         step_loss_sum += micro_loss.detach().double()
         X, Y = batches.get("train")
         scaler.scale(loss).backward()
-
     if cfg.grad_clip:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -450,14 +348,11 @@ while iter_num < cfg.max_iters:
         tokens_per_second = tokens_per_step / max(elapsed, 1e-9)
         flops_per_token = raw_model.get_flops_per_token(max_seq_len)
         flops_per_second = tokens_per_second * flops_per_token
-        mfu_text = "n/a"
+        mfu = None
         if cfg.peak_flops:
-            try:
-                mfu = raw_model.estimate_mfu(tokens_per_second, cfg.peak_flops)
-                running_mfu = mfu if running_mfu is None else 0.9 * running_mfu + 0.1 * mfu
-                mfu_text = f"{running_mfu:.8g}%"
-            except Exception:
-                mfu_text = "n/a"
+            mfu = raw_model.estimate_mfu(tokens_per_second, cfg.peak_flops)
+            running_mfu = mfu if running_mfu is None else 0.9 * running_mfu + 0.1 * mfu
+        mfu_text = "n/a" if running_mfu is None else f"{running_mfu:.8g}%"
         print(f"iter={iter_num:06d} loss={average_step_loss:.16g} "
               f"time={elapsed:.8g}s tokens/s={tokens_per_second:.8g} "
               f"FLOP/token={flops_per_token:.8g} FLOP/s={flops_per_second:.8g} MFU={mfu_text}")
