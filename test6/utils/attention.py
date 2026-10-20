@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils.pos_enc import RoPE
+
 
 class GQAAttention(nn.Module):
     def __init__(self, config):
