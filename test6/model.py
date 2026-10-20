@@ -120,10 +120,6 @@ class RoPE(nn.Module):
 
 
 
-self.attention = GQAAttention(config)
-
-
-
 class SwiGLU(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
