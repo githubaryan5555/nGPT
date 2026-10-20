@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 
 class GQAAttention(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config):
         super().__init__()
 
         self.num_attention_heads = config.num_attention_heads
