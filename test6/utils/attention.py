@@ -161,9 +161,18 @@ class GQAAttention(nn.Module):
 
         # Explicit exponentiation: this is the operation
         # you can replace with your own approximation.
-        weights = torch.exp2(shifted)
+        # Approximate 2**x using a reciprocal polynomial.
+        # shifted <= 0 because softmax subtracts the row maximum.
 
-        # Explicitly zero all masked positions.
+        z = (-shifted).clamp(min=0.0, max=8.0)
+
+        weights = torch.reciprocal(
+            1.0 + 0.69314718 * z + 0.24022651 * z * z
+        )
+
+        # Suppress sufficiently small weights.
+        weights = weights.masked_fill(shifted < -8.0, 0.0)
+                # Explicitly zero all masked positions.
         weights = weights.masked_fill(~allowed, 0.0)
 
         # Explicit denominator and normalization.
