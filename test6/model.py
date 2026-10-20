@@ -16,6 +16,7 @@ except ImportError:  # Support running ``python test4/model.py`` directly.
 
 
 from utils.attention import GQAAttention
+from utils.posenc import RoPE
 
 @dataclass
 class Config:
