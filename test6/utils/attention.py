@@ -1,6 +1,4 @@
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +7,7 @@ from utils.pos_enc import RoPE
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm used by DeepSeek MLA for the compressed KV latent."""
+    """RMSNorm for MLA's compressed query and KV representations."""
 
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -17,38 +15,39 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + self.eps)
-        return (x * self.weight.float()).to(dtype)
+        input_dtype = x.dtype
+        x_float = x.float()
+        x_float = x_float * torch.rsqrt(
+            x_float.square().mean(dim=-1, keepdim=True) + self.eps
+        )
+        return (x_float * self.weight.float()).to(input_dtype)
 
 
-class GQAAttention(nn.Module):
+class MLAAttention(nn.Module):
     """
     DeepSeek-style Multi-Head Latent Attention.
 
-    Compatible interface with the existing GQAAttention:
+    Compatible with:
         attention = MLAAttention(config)
-        y = attention(x, attention_mask=None)
+        output = attention(x, attention_mask=None)
 
-    Input:  (batch, sequence, hidden_size)
-    Output: (batch, sequence, hidden_size)
+    Input/output:
+        x:      (B, T, hidden_size)
+        output: (B, T, hidden_size)
 
-    Uses pure PyTorch operations and the compressed-KV MLA
-    computation path. No explicit full K/V reconstruction.
-
-    Required config attributes:
+    Required config:
         hidden_size
         num_attention_heads
         max_seq_len
         rope_theta
 
-    Optional config attributes:
+    Optional config:
         q_lora_rank
         kv_lora_rank
         qk_nope_head_dim
         qk_rope_head_dim
         v_head_dim
+        head_dim
         attention_dropout
         rms_norm_eps
     """
@@ -58,17 +57,15 @@ class GQAAttention(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
-
         self.max_seq_len = config.max_seq_len
+
         self.attention_dropout = getattr(
             config, "attention_dropout", 0.0
         )
 
-        # Small defaults for an initial experiment.
         self.q_lora_rank = getattr(config, "q_lora_rank", 64)
         self.kv_lora_rank = getattr(config, "kv_lora_rank", 64)
 
-        # The head dimension is split into non-rotary and rotary parts.
         head_dim = getattr(
             config,
             "head_dim",
@@ -78,53 +75,72 @@ class GQAAttention(nn.Module):
         self.qk_nope_head_dim = getattr(
             config, "qk_nope_head_dim", head_dim // 2
         )
+
         self.qk_rope_head_dim = getattr(
-            config, "qk_rope_head_dim", head_dim - self.qk_nope_head_dim
+            config,
+            "qk_rope_head_dim",
+            head_dim - self.qk_nope_head_dim,
         )
+
         self.v_head_dim = getattr(config, "v_head_dim", head_dim)
 
-        if self.qk_nope_head_dim <= 0:
-            raise ValueError("qk_nope_head_dim must be positive")
+        self.rms_norm_eps = getattr(config, "rms_norm_eps", 1e-6)
 
-        if self.qk_rope_head_dim <= 0:
-            raise ValueError("qk_rope_head_dim must be positive")
-
-        if self.qk_rope_head_dim % 2 != 0:
-            raise ValueError("qk_rope_head_dim must be even for RoPE")
+        if self.hidden_size <= 0 or self.num_attention_heads <= 0:
+            raise ValueError("hidden_size and num_attention_heads must be positive")
 
         if self.q_lora_rank < 0 or self.kv_lora_rank <= 0:
             raise ValueError("Invalid MLA low-rank dimensions")
 
+        if self.qk_nope_head_dim <= 0:
+            raise ValueError("qk_nope_head_dim must be positive")
+
+        if self.qk_rope_head_dim <= 0 or self.qk_rope_head_dim % 2:
+            raise ValueError("qk_rope_head_dim must be positive and even")
+
         if self.v_head_dim <= 0:
             raise ValueError("v_head_dim must be positive")
 
-        if self.num_attention_heads <= 0:
-            raise ValueError("num_attention_heads must be positive")
+        if not 0.0 <= self.attention_dropout <= 1.0:
+            raise ValueError("attention_dropout must be between 0 and 1")
 
+        if self.max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive")
+
+        qk_head_dim = (
+            self.qk_nope_head_dim + self.qk_rope_head_dim
+        )
+
+        # ---------------------------------------------------------
+        # 1. Query projection.
+        # ---------------------------------------------------------
         if self.q_lora_rank == 0:
             self.q_proj = nn.Linear(
                 self.hidden_size,
-                self.num_attention_heads
-                * (self.qk_nope_head_dim + self.qk_rope_head_dim),
+                self.num_attention_heads * qk_head_dim,
                 bias=False,
             )
         else:
             self.q_down_proj = nn.Linear(
-                self.hidden_size, self.q_lora_rank, bias=False
-            )
-            self.q_norm = RMSNorm(
+                self.hidden_size,
                 self.q_lora_rank,
-                getattr(config, "rms_norm_eps", 1e-6),
-            )
-            self.q_up_proj = nn.Linear(
-                self.q_lora_rank,
-                self.num_attention_heads
-                * (self.qk_nope_head_dim + self.qk_rope_head_dim),
                 bias=False,
             )
 
-        # Compress the input into a shared KV latent and a shared
-        # rotary key component.
+            self.q_norm = RMSNorm(
+                self.q_lora_rank,
+                self.rms_norm_eps,
+            )
+
+            self.q_up_proj = nn.Linear(
+                self.q_lora_rank,
+                self.num_attention_heads * qk_head_dim,
+                bias=False,
+            )
+
+        # ---------------------------------------------------------
+        # 2. Shared compressed KV latent and rotary key projection.
+        # ---------------------------------------------------------
         self.kv_down_proj = nn.Linear(
             self.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -133,12 +149,11 @@ class GQAAttention(nn.Module):
 
         self.kv_norm = RMSNorm(
             self.kv_lora_rank,
-            getattr(config, "rms_norm_eps", 1e-6),
+            self.rms_norm_eps,
         )
 
-        # Expands the latent into per-head non-rotary keys and values.
-        # During attention, its key portion is used in transposed form
-        # to transform queries into latent space.
+        # Produces each head's non-rotary key and value components
+        # from the same compressed KV latent.
         self.kv_up_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_attention_heads
@@ -146,17 +161,17 @@ class GQAAttention(nn.Module):
             bias=False,
         )
 
+        # ---------------------------------------------------------
+        # 3. Output projection.
+        # ---------------------------------------------------------
         self.o_proj = nn.Linear(
             self.num_attention_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
         )
 
-        self.softmax_scale = (
-            self.qk_nope_head_dim + self.qk_rope_head_dim
-        ) ** -0.5
+        self.softmax_scale = qk_head_dim ** -0.5
 
-        # Apply RoPE only to the rotary subspace, not to the entire head.
         self.rope = RoPE(
             self.qk_rope_head_dim,
             config.max_seq_len,
@@ -173,7 +188,7 @@ class GQAAttention(nn.Module):
             )
 
         # ---------------------------------------------------------
-        # 1. Query projection and optional query compression.
+        # 1. Project queries and split rotary/non-rotary dimensions.
         # ---------------------------------------------------------
         if self.q_lora_rank == 0:
             q = self.q_proj(x)
@@ -182,7 +197,7 @@ class GQAAttention(nn.Module):
                 self.q_norm(self.q_down_proj(x))
             )
 
-        q = q.view(
+        q = q.reshape(
             b,
             t,
             self.num_attention_heads,
@@ -191,35 +206,39 @@ class GQAAttention(nn.Module):
 
         q_nope, q_pe = torch.split(
             q,
-            [self.qk_nope_head_dim, self.qk_rope_head_dim],
+            [
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+            ],
             dim=-1,
         )
 
         q_pe = self.rope(q_pe)
 
         # ---------------------------------------------------------
-        # 2. Compress K/V into a shared latent representation.
+        # 2. Compress KV. The latent is shared across all heads.
         # ---------------------------------------------------------
         kv = self.kv_down_proj(x)
 
         kv, k_pe = torch.split(
             kv,
-            [self.kv_lora_rank, self.qk_rope_head_dim],
+            [
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            ],
             dim=-1,
         )
 
         kv = self.kv_norm(kv)
 
-        # One shared rotary key component across attention heads.
+        # Apply RoPE to the shared rotary key component.
         k_pe = self.rope(k_pe.unsqueeze(2)).squeeze(2)
 
         # ---------------------------------------------------------
-        # 3. Transform non-rotary queries into KV latent space.
+        # 3. Transform non-rotary queries into latent space.
         #
-        # Original DeepSeek optimized MLA:
-        # q_nope @ W_K  compared with  compressed KV latent.
-        #
-        # No full non-rotary K tensor is materialized.
+        # kv_up_proj.weight has shape:
+        # (heads * (key_dim + value_dim), kv_lora_rank)
         # ---------------------------------------------------------
         kv_weight = self.kv_up_proj.weight.reshape(
             self.num_attention_heads,
@@ -230,19 +249,15 @@ class GQAAttention(nn.Module):
         w_k = kv_weight[:, :self.qk_nope_head_dim, :]
 
         q_latent = torch.einsum(
-            "bshd,hdc->bshc",
+            "bthd,hdc->bthc",
             q_nope,
             w_k,
         )
 
         # ---------------------------------------------------------
-        # 4. Attention scores.
+        # 4. Calculate attention scores.
         #
-        # Non-rotary contribution:
-        #     transformed query @ compressed KV
-        #
-        # Rotary contribution:
-        #     rotary query @ shared rotary key
+        # Shape convention: (B, query_T, heads, key_T)
         # ---------------------------------------------------------
         scores = torch.einsum(
             "bshc,btc->bsht",
@@ -259,19 +274,31 @@ class GQAAttention(nn.Module):
         scores = scores * self.softmax_scale
 
         # ---------------------------------------------------------
-        # 5. Causal and padding masks.
+        # 5. Construct the causal mask.
         #
-        # A boolean attention_mask uses True/1 for valid tokens,
-        # matching the existing GQAAttention interface.
+        # FIX: scores are (B, T, H, T), so the causal mask must
+        # broadcast as (1, T, 1, T), NOT (1, 1, T, T).
         # ---------------------------------------------------------
+        causal = torch.ones(
+            (t, t),
+            device=x.device,
+            dtype=torch.bool,
+        ).tril()
+
+        # (1, query_T, 1, key_T)
+        allowed = causal[None, :, None, :]
+
+        valid = None
+
         if attention_mask is not None:
             if attention_mask.shape != (b, t):
                 raise ValueError(
-                    f"attention_mask must have shape {(b, t)}"
+                    f"attention_mask must have shape {(b, t)}, "
+                    f"got {tuple(attention_mask.shape)}"
                 )
 
             if attention_mask.device != x.device:
-                attention_mask = attention_mask.to(x.device)
+                attention_mask = attention_mask.to(device=x.device)
 
             if attention_mask.dtype == torch.bool:
                 valid = attention_mask
@@ -291,37 +318,28 @@ class GQAAttention(nn.Module):
                     "attention_mask must be boolean or numeric"
                 )
 
-            causal = torch.ones(
-                (t, t), device=x.device, dtype=torch.bool
-            ).tril()
-
-            # Shape: (B, 1, T, T).
+            # Mask invalid keys and padded query positions.
             allowed = (
-                causal[None, None, :, :]
+                allowed
                 & valid[:, None, None, :]
+                & valid[:, :, None, None]
             )
 
-            scores = scores.masked_fill(
-                ~allowed,
-                torch.finfo(scores.dtype).min,
-            )
-        else:
-            # No padding mask: causal attention only.
-            causal = torch.ones(
-                (t, t), device=x.device, dtype=torch.bool
-            ).tril()
+        scores = scores.masked_fill(
+            ~allowed,
+            torch.finfo(scores.dtype).min,
+        )
 
-            scores = scores.masked_fill(
-                ~causal[None, None, :, :],
-                torch.finfo(scores.dtype).min,
-            )
+        # ---------------------------------------------------------
+        # 6. Softmax in float32 for improved numerical stability.
+        # ---------------------------------------------------------
+        attn = F.softmax(
+            scores.float(),
+            dim=-1,
+        ).to(dtype=x.dtype)
 
-        # Float32 softmax improves numerical stability.
-        attn = F.softmax(scores.float(), dim=-1).to(x.dtype)
-
-        if attention_mask is not None:
-            # Avoid producing meaningful outputs for padded queries.
-            attn = attn * valid[:, None, :, None].to(attn.dtype)
+        if valid is not None:
+            attn = attn * valid[:, :, None, None].to(attn.dtype)
 
         attn = F.dropout(
             attn,
@@ -330,10 +348,8 @@ class GQAAttention(nn.Module):
         )
 
         # ---------------------------------------------------------
-        # 6. Aggregate compressed KV latents, then project directly
-        #    into value space.
-        #
-        # No per-head full V tensor is materialized.
+        # 7. Aggregate the compressed KV latent.
+        # No full per-head K or V tensors are materialized.
         # ---------------------------------------------------------
         out_latent = torch.einsum(
             "bsht,btc->bshc",
@@ -341,9 +357,8 @@ class GQAAttention(nn.Module):
             kv,
         )
 
-        w_v = kv_weight[
-            :, self.qk_nope_head_dim:, :
-        ]
+        # Direct latent-to-value projection.
+        w_v = kv_weight[:, self.qk_nope_head_dim:, :]
 
         out = torch.einsum(
             "bshc,hvc->bshv",
@@ -352,14 +367,16 @@ class GQAAttention(nn.Module):
         )
 
         # ---------------------------------------------------------
-        # 7. Merge heads and apply the output projection.
+        # 8. Merge heads and project to hidden_size.
         # ---------------------------------------------------------
-        out = out.contiguous().view(
-            b, t, self.num_attention_heads * self.v_head_dim
+        out = out.contiguous().reshape(
+            b,
+            t,
+            self.num_attention_heads * self.v_head_dim,
         )
 
         return self.o_proj(out)
 
 
-# Optional alias if you want to keep the existing class name
-# in your model code.
+# Keep compatibility with model.py if it imports GQAAttention.
+GQAAttention = MLAAttention
